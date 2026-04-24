@@ -140,7 +140,7 @@ class QueryDeviceOnlineHistoryView(MethodView):
 
 
 class StaticRunTimeView(MethodView):
-    """设备运行时长上报接口（POST）-- 使用redis 进行缓存"""
+    """设备运行时长上报接口（POST）-- 总是写入数据库，Redis作为缓存"""
     def post(self):
         try:
             data = request.get_json(silent=True) or {}
@@ -168,105 +168,92 @@ class StaticRunTimeView(MethodView):
                     False
                 )
 
-            now = datetime.now().isoformat()
+            now_dt = datetime.now()
+            now = now_dt.isoformat()
             key = f"runtime:{sn}:{uuid_val}"
 
             # ==============================
-            # 🚀 优先写 Redis（高性能路径）
+            # 1️⃣ 优先写入数据库（保证数据持久化）
             # ==============================
             try:
-                old_data = r.get(key)
+                conn = get_postgres_connection()
 
-                if old_data:
-                    old_data = json.loads(old_data)
+                with conn:
+                    with conn.cursor() as cur:
 
-                    max_runtime = max(old_data["max_runtime"], runtime)
+                        # UPSERT device
+                        cur.execute("""
+                            INSERT INTO device (sn, created_at)
+                            VALUES (%s, NOW())
+                            ON CONFLICT (sn)
+                            DO UPDATE SET sn = EXCLUDED.sn
+                            RETURNING id
+                        """, (sn,))
+                        device_id = cur.fetchone()[0]
 
-                    new_data = {
-                        "max_runtime": max_runtime,
-                        "first_report_time": old_data["first_report_time"],
-                        "last_report_time": now
-                    }
-                else:
-                    new_data = {
-                        "max_runtime": runtime,
-                        "first_report_time": now,
-                        "last_report_time": now
-                    }
+                        # UPSERT session
+                        cur.execute("""
+                            INSERT INTO device_run_session 
+                            (device_id, uuid, first_report_time, last_report_time, max_runtime_seconds, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (device_id, uuid)
+                            DO UPDATE SET
+                                last_report_time = EXCLUDED.last_report_time,
+                                max_runtime_seconds = GREATEST(
+                                    device_run_session.max_runtime_seconds,
+                                    EXCLUDED.max_runtime_seconds
+                                )
+                            RETURNING 
+                                first_report_time,
+                                last_report_time,
+                                max_runtime_seconds
+                        """, (device_id, uuid_val, now_dt, now_dt, runtime, now_dt))
 
-                # pipeline 提升性能
-                pipe = r.pipeline()
-                pipe.set(key, json.dumps(new_data))
-                pipe.expire(key, 86400)  # 1天过期（防脏数据）
-                pipe.execute()
+                        row = cur.fetchone()
+                        db_first_time = row[0].isoformat()
+                        db_last_time = row[1].isoformat()
+                        db_max_runtime = row[2]
 
+            except Exception as db_error:
                 return create_response(
-                    HTTPStatus.OK,
-                    "上报成功（缓存）",
-                    True,
-                    data=new_data
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"数据库写入失败: {str(db_error)}",
+                    False
                 )
 
+            # ==============================
+            # 2️⃣ 更新 Redis 缓存（提升读取性能）
+            # ==============================
+            try:
+                cache_data = {
+                    "max_runtime": db_max_runtime,
+                    "first_report_time": db_first_time,
+                    "last_report_time": now
+                }
+                
+                pipe = r.pipeline()
+                pipe.set(key, json.dumps(cache_data))
+                pipe.expire(key, 86400)  # 1天过期
+                pipe.execute()
+
             except Exception as redis_error:
-                # ==============================
-                # ⚠️ Redis挂了 → 兜底写数据库
-                # ==============================
-                try:
-                    conn = get_postgres_connection()
+                # Redis失败不影响主流程，只记录日志
+                print(f"Redis缓存更新失败: {str(redis_error)}")
 
-                    with conn:
-                        with conn.cursor() as cur:
-
-                            # 1️⃣ UPSERT device
-                            cur.execute("""
-                                INSERT INTO device (sn, created_at)
-                                VALUES (%s, NOW())
-                                ON CONFLICT (sn)
-                                DO UPDATE SET sn = EXCLUDED.sn
-                                RETURNING id
-                            """, (sn,))
-                            device_id = cur.fetchone()[0]
-
-                            now_dt = datetime.now()
-
-                            # 2️⃣ UPSERT session（核心优化）
-                            cur.execute("""
-                                INSERT INTO device_run_session 
-                                (device_id, uuid, first_report_time, last_report_time, max_runtime_seconds, created_at)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (device_id, uuid)
-                                DO UPDATE SET
-                                    last_report_time = EXCLUDED.last_report_time,
-                                    max_runtime_seconds = GREATEST(
-                                        device_run_session.max_runtime_seconds,
-                                        EXCLUDED.max_runtime_seconds
-                                    )
-                                RETURNING 
-                                    first_report_time,
-                                    last_report_time,
-                                    max_runtime_seconds
-                            """, (device_id, uuid_val, now_dt, now_dt, runtime, now_dt))
-
-                            row = cur.fetchone()
-
-                    return create_response(
-                        HTTPStatus.OK,
-                        "上报成功（数据库兜底）",
-                        True,
-                        data={
-                            "status": "ok",
-                            "session_max_runtime": row[2],
-                            "session_first_report": row[0].isoformat(),
-                            "session_last_report": row[1].isoformat()
-                        }
-                    )
-
-                except Exception as db_error:
-                    return create_response(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        f"Redis失败且数据库写入失败: {str(db_error)}",
-                        False
-                    )
+            # ==============================
+            # 返回响应
+            # ==============================
+            return create_response(
+                HTTPStatus.OK,
+                "上报成功",
+                True,
+                data={
+                    "status": "ok",
+                    "session_max_runtime": db_max_runtime,
+                    "session_first_report": db_first_time,
+                    "session_last_report": db_last_time
+                }
+            )
 
         except Exception as e:
             return create_response(
