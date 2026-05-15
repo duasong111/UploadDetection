@@ -4,7 +4,10 @@ from flask import Flask, request
 from functions.user import LoginFunction, RegisterFunction
 from functions.device import ListDevicesView, QueryDeviceOnlineHistoryView, StaticRunTimeView
 from functions.frp import QueryFrpDeviceUptimeView,UpdateFrpConfigView,UpdateN2NConfigView
+from functions.ssh_config import AddLicenseView, BatchDeployView
+from functions.device_query import QueryDeviceView
 from database.operateFunction import execuFunction
+from functions.transmission import Configuration
 from flask_cors import CORS
 from http import HTTPStatus
 
@@ -14,6 +17,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 checkLogin = LoginFunction()
 registerFunc = RegisterFunction()
 db_function = execuFunction()
+config = Configuration()
 
 @app.route("/api/register/", methods=["POST"], strict_slashes=False)
 def register():
@@ -56,7 +60,7 @@ app.add_url_rule(
     methods=['POST']
 )
 
-# 查询在线设备表
+# 查询FRP设备在线表
 app.add_url_rule(
     '/api/device_uptime/',
     view_func=QueryFrpDeviceUptimeView.as_view('query_frp_device_uptime'),
@@ -77,7 +81,32 @@ app.add_url_rule(
     methods=['POST']
 )
 
+# 设备检验流程配置
+app.add_url_rule(
+    '/api/quick_configuration/',
+    view_func=Configuration.as_view('quick_configuration'),
+    methods=['POST']
+)
+# 远程增加鉴权文件
+app.add_url_rule(
+    '/api/add_license/',
+    view_func=AddLicenseView.as_view('add_license'),
+    methods=['POST']
+)
 
+# 批量部署SSH配置文件
+app.add_url_rule(
+    '/api/batch_deploy/',
+    view_func=BatchDeployView.as_view('batch_deploy'),
+    methods=['POST']
+)
+
+# 查询设备信息
+app.add_url_rule(
+    '/api/query_device/',
+    view_func=QueryDeviceView.as_view('query_device'),
+    methods=['POST']
+)
 
 if __name__ == '__main__':
 
