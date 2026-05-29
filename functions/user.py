@@ -1,10 +1,11 @@
 from flask import request
 from http import HTTPStatus
 import secrets
-from datetime import datetime
+from datetime import datetime, date
 from Common.Response import create_response
 from database.operateFunction import execuFunction
 from functions.check import verifyPassword, generate_password_hash
+from database.Postgresql import get_postgres_connection
 
 # ==================== 登录类 ====================
 class LoginFunction:
@@ -89,3 +90,76 @@ class RegisterFunction:
 
         except Exception as e:
             return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+
+# ==================== 用户贡献统计类 ====================
+class UserContributionView:
+    """获取用户每日API请求次数贡献统计"""
+    def get_contributions(self, username=None):
+        try:
+            if not username:
+                return create_response(HTTPStatus.BAD_REQUEST, "用户名为必填项", False)
+
+            conn = get_postgres_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT login_history
+                    FROM "user"
+                    WHERE name = %s
+                """, (username,))
+                row = cur.fetchone()
+
+            if not row or row[0] is None:
+                return create_response(
+                    HTTPStatus.OK,
+                    "查询成功",
+                    True,
+                    data={"contributions": []}
+                )
+
+            login_history = row[0]
+            contributions = [
+                {"date": k, "count": int(v)}
+                for k, v in sorted(login_history.items(), reverse=True)
+            ]
+
+            return create_response(
+                HTTPStatus.OK,
+                "查询成功",
+                True,
+                data={"contributions": contributions}
+            )
+
+        except Exception as e:
+            return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()
+
+    @staticmethod
+    def increment_request_count(username):
+        """增加用户当日API请求次数"""
+        try:
+            conn = get_postgres_connection()
+            today = date.today().isoformat()
+
+            with conn.cursor() as cur:
+                # 确保 login_history 字段存在
+                cur.execute("""
+                    ALTER TABLE "user" ADD COLUMN IF NOT EXISTS login_history JSONB DEFAULT '{}'
+                """)
+                conn.commit()
+
+                # 使用 JSONB 函数更新请求次数
+                cur.execute("""
+                    UPDATE "user"
+                    SET login_history = COALESCE(login_history, '{}'::jsonb) ||
+                        jsonb_build_object(%s, COALESCE((login_history->>%s)::int, 0) + 1)
+                    WHERE name = %s
+                """, (today, today, username))
+                conn.commit()
+        except Exception as e:
+            print(f"更新请求次数失败: {str(e)}")
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()

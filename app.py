@@ -1,7 +1,7 @@
 from flask_socketio import emit
 from Common.Response import create_response
 from flask import Flask, request
-from functions.user import LoginFunction, RegisterFunction
+from functions.user import LoginFunction, RegisterFunction, UserContributionView
 from functions.device import ListDevicesView, QueryDeviceOnlineHistoryView, StaticRunTimeView
 from functions.frp import QueryFrpDeviceUptimeView,UpdateFrpConfigView,UpdateN2NConfigView
 from functions.ssh_config import AddLicenseView, BatchDeployView
@@ -14,8 +14,44 @@ from http import HTTPStatus
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# 不计入请求统计的接口
+EXCLUDED_PATHS = {'/api/login/', '/api/register/', '/api/user_contributions/'}
+
+@app.before_request
+def track_request_count():
+    """统计所有API请求次数"""
+    from functions.user import UserContributionView
+
+    # 排除不需要计数的接口
+    if request.path in EXCLUDED_PATHS:
+        return
+
+    # 仅统计 /api/ 开头的请求
+    if not request.path.startswith('/api/'):
+        return
+
+    # 从请求中获取用户名
+    username = None
+
+    # 1. 尝试从请求体获取
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        username = data.get('username')
+
+    # 2. 尝试从 header 获取
+    if not username:
+        username = request.headers.get('X-Username')
+
+    # 3. 尝试从 query string 获取
+    if not username:
+        username = request.args.get('username')
+
+    if username:
+        UserContributionView.increment_request_count(username)
+
 checkLogin = LoginFunction()
 registerFunc = RegisterFunction()
+userContributionView = UserContributionView()
 db_function = execuFunction()
 config = Configuration()
 
@@ -107,6 +143,16 @@ app.add_url_rule(
     view_func=QueryDeviceView.as_view('query_device'),
     methods=['POST']
 )
+
+# 用户贡献统计（每日登录次数）
+@app.route("/api/user_contributions/", methods=["POST"], strict_slashes=False)
+def user_contributions():
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        return userContributionView.get_contributions(username)
+    except Exception as e:
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
 if __name__ == '__main__':
 
