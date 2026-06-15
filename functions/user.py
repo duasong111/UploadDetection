@@ -1,4 +1,5 @@
 from flask import request
+from flask.views import View
 from http import HTTPStatus
 import secrets
 from datetime import datetime, date
@@ -40,7 +41,13 @@ class LoginFunction:
                 HTTPStatus.OK,
                 "登录成功",
                 True,
-                data={"token": new_token, "username": username}
+                data={
+                    "token": new_token,
+                    "username": username,
+                    "avatar_path": query_result.get("avatar_path"),
+                    "updated_time": query_result.get("updated_time").isoformat() if query_result.get("updated_time") else None,
+                    "created_time": query_result.get("created_time").isoformat() if query_result.get("created_time") else None,
+                }
             )
 
         except Exception as e:
@@ -163,3 +170,65 @@ class UserContributionView:
         finally:
             if 'conn' in locals() and conn:
                 conn.close()
+
+
+# ==================== 修改密码类 ====================
+class ChangePasswordView(View):
+    """修改用户密码"""
+
+    def dispatch_request(self):
+        try:
+            data = request.get_json()
+            username = data.get('username')
+            old_password = data.get('old_password')
+            new_password = data.get('new_password')
+
+            if not username or not old_password or not new_password:
+                return create_response(HTTPStatus.BAD_REQUEST, "用户名、旧密码和新密码为必填项", False)
+
+            if len(new_password) < 8:
+                return create_response(HTTPStatus.BAD_REQUEST, "新密码长度至少 8 位", False)
+
+            db_function = execuFunction()
+
+            # 查询用户
+            query_result = db_function.query_individual_users(
+                dbName='user', queryParams="name", queryData=username)
+            if not query_result:
+                return create_response(HTTPStatus.BAD_REQUEST, "用户不存在", False)
+
+            # 验证旧密码
+            stored_password = query_result['password']
+            stored_salt = bytes.fromhex(query_result.get('salt', ''))
+            if not verifyPassword(old_password, stored_password, stored_salt):
+                return create_response(HTTPStatus.BAD_REQUEST, "旧密码错误", False)
+
+            # 生成新密码哈希
+            hashed, salt = generate_password_hash(new_password)
+            salt_hex = salt.hex()
+
+            # 更新密码
+            db_function.update_user_key_value(
+                db_name='user',
+                key_value='name',
+                username=username,
+                new_data=hashed,
+                key_type='password'
+            )
+            # 更新盐值
+            db_function.update_user_key_value(
+                db_name='user',
+                key_value='name',
+                username=username,
+                new_data=salt_hex,
+                key_type='salt'
+            )
+
+            return create_response(
+                HTTPStatus.OK,
+                "密码修改成功",
+                True
+            )
+
+        except Exception as e:
+            return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)

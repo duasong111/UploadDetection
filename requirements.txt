@@ -23,3 +23,6 @@ eventlet>=0.30.0
 python-socketio>=5.0.0
 python-engineio>=4.0.0
 psycopg2-binary>=2.9.0
+
+# 对象存储（MinIO 兼容 RUSTFS）
+minio>=7.0.0

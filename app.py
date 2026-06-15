@@ -1,18 +1,19 @@
 from flask_socketio import emit
 from Common.Response import create_response
 from flask import Flask, request
-from functions.user import LoginFunction, RegisterFunction, UserContributionView
+from functions.user import LoginFunction, RegisterFunction, UserContributionView, ChangePasswordView
 from functions.device import ListDevicesView, QueryDeviceOnlineHistoryView, StaticRunTimeView
 from functions.frp import QueryFrpDeviceUptimeView,UpdateFrpConfigView,UpdateN2NConfigView
 from functions.ssh_config import AddLicenseView, BatchDeployView
 from functions.device_query import QueryDeviceView
+from functions.avatar import AvatarManager
 from database.operateFunction import execuFunction
 from functions.transmission import Configuration
 from flask_cors import CORS
 from http import HTTPStatus
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}}, supports_credentials=True)
 
 # 不计入请求统计的接口
 EXCLUDED_PATHS = {'/api/login/', '/api/register/', '/api/user_contributions/'}
@@ -52,6 +53,8 @@ def track_request_count():
 checkLogin = LoginFunction()
 registerFunc = RegisterFunction()
 userContributionView = UserContributionView()
+changePasswordView = ChangePasswordView()
+avatar_manager = AvatarManager()
 db_function = execuFunction()
 config = Configuration()
 
@@ -74,6 +77,13 @@ def login():
         return checkLogin.checklogin(user, pwd)
     except Exception as e:
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+# 修改密码
+app.add_url_rule(
+    '/api/change_password/',
+    view_func=ChangePasswordView.as_view('change_password'),
+    methods=['POST']
+)
 
 # 展示设备列表
 app.add_url_rule(
@@ -153,6 +163,33 @@ def user_contributions():
         return userContributionView.get_contributions(username)
     except Exception as e:
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+
+# 用户头像上传
+@app.route("/api/upload_avatar/", methods=["POST"], strict_slashes=False)
+def upload_avatar():
+    try:
+        username = request.form.get('username') or (request.json.get('username') if request.is_json else None)
+        file = request.files.get('file')
+
+        if not username:
+            return create_response(HTTPStatus.BAD_REQUEST, "用户名为必填项", False)
+        if not file:
+            return create_response(HTTPStatus.BAD_REQUEST, "文件为必填项", False)
+
+        return avatar_manager.upload_avatar(username, file)
+    except Exception as e:
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+# 获取用户头像
+@app.route("/api/avatar/<path:filename>/", methods=["GET"], strict_slashes=False)
+@app.route("/api/avatar/<path:filename>", methods=["GET"], strict_slashes=False)
+def get_avatar(filename):
+    try:
+        return avatar_manager.get_avatar(filename)
+    except Exception as e:
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
 
 if __name__ == '__main__':
 

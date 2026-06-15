@@ -15,26 +15,62 @@ class ListDevicesView(MethodView):
 
     def get(self):
         try:
+            from datetime import datetime, timedelta
             db_function = execuFunction()
             conn = None
 
             from database.Postgresql import get_postgres_connection
             conn = get_postgres_connection()
+
+            # 获取24小时前的时间戳
+            yesterday = (datetime.now() - timedelta(days=1))
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
             with conn.cursor() as cur:
+                # 查询设备及其最新上报时间
                 cur.execute("""
-                    SELECT sn, created_at 
-                    FROM device 
-                    ORDER BY created_at DESC
+                    SELECT d.id, d.sn, d.created_at,
+                           MAX(drs.last_report_time) as last_report
+                    FROM device d
+                    LEFT JOIN device_run_session drs ON d.id = drs.device_id
+                    GROUP BY d.id, d.sn, d.created_at
+                    ORDER BY d.created_at DESC
                 """)
                 rows = cur.fetchall()
 
             data = []
+            online_count = 0
+            offline_count = 0
+            today_new_count = 0
+
             for row in rows:
-                created_at = row[1]
+                device_id = row[0]
+                sn = row[1]
+                created_at = row[2]
+                last_report = row[3]
+
+                # 判断是否在线：24小时内有上报记录
+                is_online = last_report is not None and last_report >= yesterday
+
+                # 今日新增：创建时间在今天0点之后
+                is_today_new = created_at is not None and created_at >= today_start
+
+                if is_online:
+                    online_count += 1
+                else:
+                    offline_count += 1
+
+                if is_today_new:
+                    today_new_count += 1
+
                 data.append({
-                    "sn": row[0],
+                    "sn": sn,
                     "created_at": created_at.isoformat() if created_at else None,
-                    "created_at_local": created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if created_at else None
+                    "created_at_local": created_at.strftime("%Y-%m-%d %H:%M:%S") if created_at else None,
+                    "last_report": last_report.isoformat() if last_report else None,
+                    "last_report_local": last_report.strftime("%Y-%m-%d %H:%M:%S") if last_report else None,
+                    "is_online": is_online,
+                    "is_today_new": is_today_new
                 })
 
             return create_response(
@@ -43,6 +79,9 @@ class ListDevicesView(MethodView):
                 True,
                 data={
                     "total_devices": len(data),
+                    "online_devices": online_count,
+                    "offline_devices": offline_count,
+                    "today_new_devices": today_new_count,
                     "devices": data
                 }
             )
@@ -94,9 +133,9 @@ class QueryDeviceOnlineHistoryView(MethodView):
             conn = get_postgres_connection()
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT uuid, first_report_time, last_report_time, 
+                    SELECT uuid, first_report_time, last_report_time,
                            max_runtime_seconds, created_at
-                    FROM device_run_session 
+                    FROM device_run_session
                     WHERE device_id = (SELECT id FROM device WHERE sn = %s)
                     ORDER BY first_report_time DESC
                     LIMIT %s
@@ -193,7 +232,7 @@ class StaticRunTimeView(MethodView):
 
                         # UPSERT session
                         cur.execute("""
-                            INSERT INTO device_run_session 
+                            INSERT INTO device_run_session
                             (device_id, uuid, first_report_time, last_report_time, max_runtime_seconds, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s)
                             ON CONFLICT (device_id, uuid)
@@ -203,7 +242,7 @@ class StaticRunTimeView(MethodView):
                                     device_run_session.max_runtime_seconds,
                                     EXCLUDED.max_runtime_seconds
                                 )
-                            RETURNING 
+                            RETURNING
                                 first_report_time,
                                 last_report_time,
                                 max_runtime_seconds
@@ -230,15 +269,15 @@ class StaticRunTimeView(MethodView):
                     "first_report_time": db_first_time,
                     "last_report_time": now
                 }
-                
+
                 pipe = r.pipeline()
                 pipe.set(key, json.dumps(cache_data))
                 pipe.expire(key, 86400)  # 1天过期
                 pipe.execute()
 
-            except Exception as redis_error:
-                # Redis失败不影响主流程，只记录日志
-                print(f"Redis缓存更新失败: {str(redis_error)}")
+            except Exception:
+                # Redis失败不影响主流程
+                pass
 
             # ==============================
             # 返回响应
