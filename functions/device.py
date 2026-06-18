@@ -5,7 +5,10 @@ from flask.views import MethodView
 from http import HTTPStatus
 from Common.Response import create_response
 from database.operateFunction import execuFunction
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# 北京时间比 UTC 快 8 小时
+BEIJING_OFFSET = timedelta(hours=8)
 from config import REDIS_URL
 from database.Postgresql import get_postgres_connection
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -22,9 +25,10 @@ class ListDevicesView(MethodView):
             from database.Postgresql import get_postgres_connection
             conn = get_postgres_connection()
 
-            # 获取24小时前的时间戳
-            yesterday = (datetime.now() - timedelta(days=1))
-            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            # 使用服务器本地时间计算24小时前和今天0点
+            now_server = datetime.now()
+            yesterday = now_server - timedelta(days=1)
+            today_start = now_server.replace(hour=0, minute=0, second=0, microsecond=0)
 
             with conn.cursor() as cur:
                 # 查询设备及其最新上报时间
@@ -43,11 +47,25 @@ class ListDevicesView(MethodView):
             offline_count = 0
             today_new_count = 0
 
+            def to_local_naive(dt):
+                """将 datetime 转为北京时间显示（UTC + 8小时）"""
+                if dt is None:
+                    return None
+                # 先移除时区信息（如果有），然后加上8小时偏移
+                if dt.tzinfo is not None:
+                    dt = dt.replace(tzinfo=None)
+                # 加上8小时偏移转换为北京时间
+                dt = dt + BEIJING_OFFSET
+                return dt
+
             for row in rows:
                 device_id = row[0]
                 sn = row[1]
-                created_at = row[2]
-                last_report = row[3]
+                created_at_raw = row[2]
+                last_report_raw = row[3]
+
+                created_at = to_local_naive(created_at_raw)
+                last_report = to_local_naive(last_report_raw)
 
                 # 判断是否在线：24小时内有上报记录
                 is_online = last_report is not None and last_report >= yesterday
@@ -144,15 +162,29 @@ class QueryDeviceOnlineHistoryView(MethodView):
 
             records = []
             for row in rows:
+                # 转换为北京时间显示（UTC + 8小时）
+                def format_dt(dt):
+                    if dt is None:
+                        return None
+                    # 移除时区信息，然后加8小时
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
+                    dt = dt + BEIJING_OFFSET
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+                start_dt = format_dt(row[1])
+                end_dt = format_dt(row[2])
+                created_dt = format_dt(row[4])
+
                 records.append({
                     "uuid": row[0],
                     "start_time": row[1].isoformat() if row[1] else None,
                     "end_time": row[2].isoformat() if row[2] else None,
                     "max_runtime_seconds": row[3],
                     "created_at": row[4].isoformat() if row[4] else None,
-                    "start_time_local": row[1].astimezone().strftime("%Y-%m-%d %H:%M:%S") if row[1] else None,
-                    "end_time_local": row[2].astimezone().strftime("%Y-%m-%d %H:%M:%S") if row[2] else None,
-                    "created_at_local": row[4].astimezone().strftime("%Y-%m-%d %H:%M:%S") if row[4] else None,
+                    "start_time_local": start_dt,
+                    "end_time_local": end_dt,
+                    "created_at_local": created_dt,
                 })
 
             return create_response(
@@ -207,8 +239,8 @@ class StaticRunTimeView(MethodView):
                     False
                 )
 
-            now_dt = datetime.now()
-            now = now_dt.isoformat()
+            # 使用服务器本地时间存储
+            now_local = datetime.now()
             key = f"runtime:{sn}:{uuid_val}"
 
             # ==============================
@@ -246,7 +278,7 @@ class StaticRunTimeView(MethodView):
                                 first_report_time,
                                 last_report_time,
                                 max_runtime_seconds
-                        """, (device_id, uuid_val, now_dt, now_dt, runtime, now_dt))
+                        """, (device_id, uuid_val, now_local, now_local, runtime, now_local))
 
                         row = cur.fetchone()
                         db_first_time = row[0].isoformat()

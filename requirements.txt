@@ -26,3 +26,6 @@ psycopg2-binary>=2.9.0
 
 # 对象存储（MinIO 兼容 RUSTFS）
 minio>=7.0.0
+
+# 向量数据库（本地 RAG）
+chromadb>=0.4.0

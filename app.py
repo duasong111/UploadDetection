@@ -7,6 +7,8 @@ from functions.frp import QueryFrpDeviceUptimeView,UpdateFrpConfigView,UpdateN2N
 from functions.ssh_config import AddLicenseView, BatchDeployView
 from functions.device_query import QueryDeviceView
 from functions.avatar import AvatarManager
+from functions.ai_chat import ai_chat_view
+from functions.rag_knowledge import rag_service
 from database.operateFunction import execuFunction
 from functions.transmission import Configuration
 from flask_cors import CORS
@@ -160,7 +162,8 @@ def user_contributions():
     try:
         data = request.get_json()
         username = data.get('username')
-        return userContributionView.get_contributions(username)
+        month = data.get('month')  # 格式: "YYYY-MM"
+        return userContributionView.get_contributions(username, month)
     except Exception as e:
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
@@ -189,6 +192,52 @@ def get_avatar(filename):
         return avatar_manager.get_avatar(filename)
     except Exception as e:
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+
+# AI 聊天接口
+app.add_url_rule(
+    '/api/ai_chat/',
+    view_func=ai_chat_view,
+    methods=['POST']
+)
+
+# RAG 知识库初始化（首次使用需要调用一次）
+@app.route("/api/rag/init/", methods=["POST"], strict_slashes=False)
+def rag_init():
+    try:
+        result = rag_service.initialize_knowledge_base()
+        return create_response(HTTPStatus.OK, "知识库初始化成功", True, data=result)
+    except Exception as e:
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"知识库初始化失败: {str(e)}", False)
+
+# RAG 问答接口
+@app.route("/api/rag/query/", methods=["POST"], strict_slashes=False)
+def rag_query():
+    try:
+        data = request.get_json()
+        question = data.get('question')
+        top_k = data.get('top_k', 5)
+
+        if not question:
+            return create_response(HTTPStatus.BAD_REQUEST, "问题不能为空", False)
+
+        answer, chunks = rag_service.ask(question, top_k)
+
+        # 构建检索结果摘要
+        references = []
+        for chunk in chunks:
+            references.append({
+                "content": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content'],
+                "relevance_score": round(chunk.get('relevance_score', 0), 4),
+                "metadata": chunk.get('metadata', {})
+            })
+
+        return create_response(HTTPStatus.OK, "查询成功", True, data={
+            "answer": answer,
+            "references": references
+        })
+    except Exception as e:
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"查询失败: {str(e)}", False)
 
 
 if __name__ == '__main__':

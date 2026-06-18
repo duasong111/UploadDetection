@@ -102,7 +102,11 @@ class RegisterFunction:
 # ==================== 用户贡献统计类 ====================
 class UserContributionView:
     """获取用户每日API请求次数贡献统计"""
-    def get_contributions(self, username=None):
+    def get_contributions(self, username=None, month=None):
+        """
+        获取用户每日API请求次数贡献统计
+        month: 可选，格式 "YYYY-MM"，如 "2026-06"
+        """
         try:
             if not username:
                 return create_response(HTTPStatus.BAD_REQUEST, "用户名为必填项", False)
@@ -125,10 +129,22 @@ class UserContributionView:
                 )
 
             login_history = row[0]
-            contributions = [
-                {"date": k, "count": int(v)}
-                for k, v in sorted(login_history.items(), reverse=True)
-            ]
+
+            # 过滤指定月份
+            if month:
+                contributions = [
+                    {"date": k, "count": int(v)}
+                    for k, v in login_history.items()
+                    if k.startswith(month)
+                ]
+            else:
+                contributions = [
+                    {"date": k, "count": int(v)}
+                    for k, v in login_history.items()
+                ]
+
+            # 按日期倒序排列
+            contributions.sort(key=lambda x: x["date"], reverse=True)
 
             return create_response(
                 HTTPStatus.OK,
