@@ -1,4 +1,4 @@
-from flask_socketio import emit
+from flask_socketio import SocketIO, emit
 from Common.Response import create_response
 from flask import Flask, request
 from functions.user import LoginFunction, RegisterFunction, UserContributionView, ChangePasswordView
@@ -8,14 +8,56 @@ from functions.ssh_config import AddLicenseView, BatchDeployView
 from functions.device_query import QueryDeviceView
 from functions.avatar import AvatarManager
 from functions.ai_chat import ai_chat_view
-from functions.rag_knowledge import rag_service
 from database.operateFunction import execuFunction
 from functions.transmission import Configuration
 from flask_cors import CORS
 from http import HTTPStatus
+checkLogin = LoginFunction()
+registerFunc = RegisterFunction()
+userContributionView = UserContributionView()
+changePasswordView = ChangePasswordView()
+avatar_manager = AvatarManager()
+db_function = execuFunction()
+config = Configuration()
+
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+
+# ==================== WebSocket 事件 ====================
+@socketio.on('connect')
+def handle_connect():
+    """客户端连接"""
+    print(f"客户端连接: {request.sid}")
+    emit('connected', {'sid': request.sid})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """客户端断开"""
+    print(f"客户端断开: {request.sid}")
+
+
+@socketio.on('ai_chat')
+def handle_ai_chat(data):
+    """处理 AI 聊天 WebSocket 事件"""
+    from functions.ai_chat import ai_chat_view
+
+    message = data.get('message')
+    history = data.get('history', [])
+    username = data.get('username')
+
+    if not message:
+        emit('ai_response', {'success': False, 'message': '消息内容不能为空'})
+        return
+
+    # 调用 AI
+    result, success = ai_chat_view.chat(message, history, username)
+
+    # 通过 WebSocket 发送结果
+    emit('ai_response', result)
 
 # 不计入请求统计的接口
 EXCLUDED_PATHS = {'/api/login/', '/api/register/', '/api/user_contributions/'}
@@ -52,13 +94,6 @@ def track_request_count():
     if username:
         UserContributionView.increment_request_count(username)
 
-checkLogin = LoginFunction()
-registerFunc = RegisterFunction()
-userContributionView = UserContributionView()
-changePasswordView = ChangePasswordView()
-avatar_manager = AvatarManager()
-db_function = execuFunction()
-config = Configuration()
 
 @app.route("/api/register/", methods=["POST"], strict_slashes=False)
 def register():
@@ -201,45 +236,7 @@ app.add_url_rule(
     methods=['POST']
 )
 
-# RAG 知识库初始化（首次使用需要调用一次）
-@app.route("/api/rag/init/", methods=["POST"], strict_slashes=False)
-def rag_init():
-    try:
-        result = rag_service.initialize_knowledge_base()
-        return create_response(HTTPStatus.OK, "知识库初始化成功", True, data=result)
-    except Exception as e:
-        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"知识库初始化失败: {str(e)}", False)
-
-# RAG 问答接口
-@app.route("/api/rag/query/", methods=["POST"], strict_slashes=False)
-def rag_query():
-    try:
-        data = request.get_json()
-        question = data.get('question')
-        top_k = data.get('top_k', 5)
-
-        if not question:
-            return create_response(HTTPStatus.BAD_REQUEST, "问题不能为空", False)
-
-        answer, chunks = rag_service.ask(question, top_k)
-
-        # 构建检索结果摘要
-        references = []
-        for chunk in chunks:
-            references.append({
-                "content": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content'],
-                "relevance_score": round(chunk.get('relevance_score', 0), 4),
-                "metadata": chunk.get('metadata', {})
-            })
-
-        return create_response(HTTPStatus.OK, "查询成功", True, data={
-            "answer": answer,
-            "references": references
-        })
-    except Exception as e:
-        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"查询失败: {str(e)}", False)
-
 
 if __name__ == '__main__':
 
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)

@@ -187,6 +187,57 @@ class UserContributionView:
             if 'conn' in locals() and conn:
                 conn.close()
 
+    @staticmethod
+    def get_ai_usage_count(username):
+        """获取用户当日AI使用次数"""
+        try:
+            conn = get_postgres_connection()
+            today = date.today().isoformat()
+
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT login_history->>%s
+                    FROM "user"
+                    WHERE name = %s
+                """, (today, username))
+                row = cur.fetchone()
+
+            if row and row[0]:
+                return int(row[0])
+            return 0
+        except Exception as e:
+            print(f"获取AI使用次数失败: {str(e)}")
+            return 0
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()
+
+    @staticmethod
+    def increment_ai_usage_count(username):
+        """增加用户当日AI使用次数"""
+        try:
+            conn = get_postgres_connection()
+            today = date.today().isoformat()
+
+            with conn.cursor() as cur:
+                # 使用 JSONB 函数更新 AI 使用次数（存储在 login_history 的 ai_chat 子节点）
+                cur.execute("""
+                    UPDATE "user"
+                    SET login_history = COALESCE(login_history, '{}'::jsonb) ||
+                        jsonb_build_object(
+                            'ai_chat', jsonb_build_object(
+                                %s, COALESCE((login_history->'ai_chat'->>%s)::int, 0) + 1
+                            )
+                        )
+                    WHERE name = %s
+                """, (today, today, username))
+                conn.commit()
+        except Exception as e:
+            print(f"更新AI使用次数失败: {str(e)}")
+        finally:
+            if 'conn' in locals() and conn:
+                conn.close()
+
 
 # ==================== 修改密码类 ====================
 class ChangePasswordView(View):

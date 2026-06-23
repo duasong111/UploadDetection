@@ -6,15 +6,22 @@ from flask import send_file, Response
 from minio import Minio
 from minio.error import S3Error
 from http import HTTPStatus
+import redis
+import json
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     BUCKET_IP, BUCKET_PORT, RUSTFS_BUCKET_NAME, RUSTFS_SECRET,
-    AVATAR_BUCKET_NAME
+    AVATAR_BUCKET_NAME, REDIS_URL
 )
 from Common.Response import create_response
 from database.operateFunction import execuFunction
+
+# Redis 缓存客户端
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+AVATAR_CACHE_TTL = 3600  # 头像缓存过期时间（秒），默认 1 小时
+AVATAR_CACHE_PREFIX = "avatar:"  # 缓存 key 前缀
 
 
 # ==================== 头像管理类 ====================
@@ -41,6 +48,43 @@ class AvatarManager:
                 self.client.make_bucket(self.bucket_name)
         except S3Error:
             pass
+
+    def _get_avatar_cache(self, filename):
+        """从 Redis 获取头像缓存"""
+        try:
+            cache_key = f"{AVATAR_CACHE_PREFIX}{filename}"
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+            return None
+        except Exception as e:
+            print(f"获取头像缓存失败: {e}")
+            return None
+
+    def _set_avatar_cache(self, filename, file_content, content_type):
+        """设置头像 Redis 缓存"""
+        try:
+            cache_key = f"{AVATAR_CACHE_PREFIX}{filename}"
+            cache_data = {
+                "content": file_content.decode('latin-1'),  # 存储二进制数据
+                "content_type": content_type
+            }
+            redis_client.setex(cache_key, AVATAR_CACHE_TTL, json.dumps(cache_data))
+        except Exception as e:
+            print(f"设置头像缓存失败: {e}")
+
+    def _invalidate_avatar_cache(self, username):
+        """清除用户头像缓存"""
+        try:
+            # 获取用户的头像文件名
+            db_function = execuFunction()
+            user_info = db_function.query_individual_users(
+                dbName='user', queryParams="name", queryData=username)
+            if user_info and user_info.get('avatar_path'):
+                cache_key = f"{AVATAR_CACHE_PREFIX}{user_info['avatar_path']}"
+                redis_client.delete(cache_key)
+        except Exception as e:
+            print(f"清除头像缓存失败: {e}")
 
     def _allowed_file(self, filename):
         """检查文件扩展名是否允许"""
@@ -97,6 +141,9 @@ class AvatarManager:
 
             avatar_url = filename  # 只返回文件名，前端会拼接完整URL
 
+            # 清除该用户的头像缓存
+            self._invalidate_avatar_cache(username)
+
             return create_response(
                 HTTPStatus.OK,
                 "头像上传成功",
@@ -110,18 +157,13 @@ class AvatarManager:
             return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
     def get_avatar(self, filename):
-        """获取用户头像"""
+        """获取用户头像（带 Redis 缓存）"""
         try:
             # 移除尾部斜杠（Flask <path:filename> 会捕获斜杠）
             filename = filename.rstrip('/')
 
             if not filename:
                 return create_response(HTTPStatus.BAD_REQUEST, "文件名为必填项", False)
-
-            # 从 RUSTFS 获取文件
-            response = self.client.get_object(self.bucket_name, filename)
-            file_content = response.read()
-            response.close()
 
             # 获取内容类型
             ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else 'jpg'
@@ -133,6 +175,26 @@ class AvatarManager:
                 'webp': 'image/webp'
             }
             content_type = content_type_map.get(ext, 'image/jpeg')
+
+            # 尝试从 Redis 缓存获取
+            cached = self._get_avatar_cache(filename)
+            if cached:
+                # 从缓存返回
+                file_content = cached['content'].encode('latin-1')
+                return send_file(
+                    BytesIO(file_content),
+                    mimetype=content_type,
+                    as_attachment=False,
+                    download_name=filename
+                )
+
+            # 从 RUSTFS 获取文件
+            response = self.client.get_object(self.bucket_name, filename)
+            file_content = response.read()
+            response.close()
+
+            # 写入 Redis 缓存
+            self._set_avatar_cache(filename, file_content, content_type)
 
             return send_file(
                 BytesIO(file_content),

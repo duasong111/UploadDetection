@@ -13,12 +13,36 @@ from config import REDIS_URL
 from database.Postgresql import get_postgres_connection
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
+# 缓存配置
+DEVICE_LIST_CACHE_TTL = 30  # 设备列表缓存时间（秒），因为设备30秒上报一次
+DEVICE_HISTORY_CACHE_TTL = 60  # 设备历史缓存时间（秒）
+DEVICE_LIST_CACHE_KEY = "device:list:all"
+DEVICE_HISTORY_CACHE_PREFIX = "device:history:"
+
 class ListDevicesView(MethodView):
-    """查询所有设备列表（GET）"""
+    """查询所有设备列表（GET）-- 带 Redis 缓存"""
 
     def get(self):
         try:
             from datetime import datetime, timedelta
+
+            # 尝试从 Redis 缓存获取
+            try:
+                cached = r.get(DEVICE_LIST_CACHE_KEY)
+                if cached:
+                    cached_data = json.loads(cached)
+                    # 添加缓存命中标记
+                    cached_data['from_cache'] = True
+                    return create_response(
+                        HTTPStatus.OK,
+                        "查询成功（缓存）",
+                        True,
+                        data=cached_data
+                    )
+            except Exception:
+                pass  # 缓存失败，继续查数据库
+
+            # 查询数据库
             db_function = execuFunction()
             conn = None
 
@@ -91,17 +115,26 @@ class ListDevicesView(MethodView):
                     "is_today_new": is_today_new
                 })
 
+            # 构建返回数据
+            result_data = {
+                "total_devices": len(data),
+                "online_devices": online_count,
+                "offline_devices": offline_count,
+                "today_new_devices": today_new_count,
+                "devices": data
+            }
+
+            # 写入 Redis 缓存
+            try:
+                r.setex(DEVICE_LIST_CACHE_KEY, DEVICE_LIST_CACHE_TTL, json.dumps(result_data))
+            except Exception:
+                pass  # 缓存失败不影响返回
+
             return create_response(
                 HTTPStatus.OK,
                 "查询成功",
                 True,
-                data={
-                    "total_devices": len(data),
-                    "online_devices": online_count,
-                    "offline_devices": offline_count,
-                    "today_new_devices": today_new_count,
-                    "devices": data
-                }
+                data=result_data
             )
 
         except Exception as e:
@@ -116,7 +149,7 @@ class ListDevicesView(MethodView):
 
 
 class QueryDeviceOnlineHistoryView(MethodView):
-    """查询设备上线历史（POST）"""
+    """查询设备上线历史（POST）-- 带 Redis 缓存"""
     def post(self):
         try:
             data = request.get_json() or {}
@@ -146,6 +179,24 @@ class QueryDeviceOnlineHistoryView(MethodView):
                     f"未找到序列号为 {sn} 的设备",
                     False
                 )
+
+            # 生成缓存 key
+            cache_key = f"{DEVICE_HISTORY_CACHE_PREFIX}{sn}:{n}"
+
+            # 尝试从 Redis 缓存获取
+            try:
+                cached = r.get(cache_key)
+                if cached:
+                    cached_data = json.loads(cached)
+                    cached_data['from_cache'] = True
+                    return create_response(
+                        HTTPStatus.OK,
+                        "查询成功（缓存）",
+                        True,
+                        data=cached_data
+                    )
+            except Exception:
+                pass  # 缓存失败，继续查数据库
 
             from database.Postgresql import get_postgres_connection
             conn = get_postgres_connection()
@@ -187,16 +238,25 @@ class QueryDeviceOnlineHistoryView(MethodView):
                     "created_at_local": created_dt,
                 })
 
+            # 构建返回数据
+            result_data = {
+                "device_sn": sn,
+                "total_sessions_found": len(records),
+                "requested_count": n,
+                "records": records
+            }
+
+            # 写入 Redis 缓存
+            try:
+                r.setex(cache_key, DEVICE_HISTORY_CACHE_TTL, json.dumps(result_data))
+            except Exception:
+                pass  # 缓存失败不影响返回
+
             return create_response(
                 HTTPStatus.OK,
                 "查询成功",
                 True,
-                data={
-                    "device_sn": sn,
-                    "total_sessions_found": len(records),
-                    "requested_count": n,
-                    "records": records
-                }
+                data=result_data
             )
 
         except Exception as e:
@@ -299,12 +359,16 @@ class StaticRunTimeView(MethodView):
                 cache_data = {
                     "max_runtime": db_max_runtime,
                     "first_report_time": db_first_time,
-                    "last_report_time": now
+                    "last_report_time": now_local.isoformat()
                 }
 
                 pipe = r.pipeline()
                 pipe.set(key, json.dumps(cache_data))
                 pipe.expire(key, 86400)  # 1天过期
+                # 清除设备列表缓存（因为有新上报）
+                pipe.delete(DEVICE_LIST_CACHE_KEY)
+                # 清除该设备的历史缓存（因为有新上报）
+                pipe.delete(f"{DEVICE_HISTORY_CACHE_PREFIX}{sn}:*")
                 pipe.execute()
 
             except Exception:
