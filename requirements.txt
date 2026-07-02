@@ -29,3 +29,12 @@ minio>=7.0.0
 
 # 向量数据库（本地 RAG）
 chromadb>=0.4.0
+
+# LangChain（书籍 RAG）
+langchain>=0.1.0
+langchain-community>=0.0.20
+langchain-text-splitters>=0.1.0
+
+# PDF 处理
+pypdf>=4.0.0
+langchain-core>=0.1.0

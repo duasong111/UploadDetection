@@ -25,6 +25,16 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+# ==================== 书籍 RAG 接口 ====================
+from functions.book_rag import book_rag_service
+import redis
+import hashlib
+from config import REDIS_URL
+
+book_redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+BOOK_HASH_PREFIX = "book:hash:"  # 书籍文件哈希缓存前缀
+BOOK_HASH_TTL = 86400 * 30  # 30天过期
+
 
 # ==================== WebSocket 事件 ====================
 @socketio.on('connect')
@@ -235,6 +245,115 @@ app.add_url_rule(
     view_func=ai_chat_view,
     methods=['POST']
 )
+
+
+
+# 上传书籍
+@app.route("/api/book/upload/", methods=["POST"], strict_slashes=False)
+def upload_book():
+    try:
+        if 'file' not in request.files:
+            return create_response(HTTPStatus.BAD_REQUEST, "请选择要上传的书籍文件", False)
+
+        file = request.files['file']
+        book_name = request.form.get('book_name') or file.filename.replace('.pdf', '')
+
+        if not file.filename.lower().endswith('.pdf'):
+            return create_response(HTTPStatus.BAD_REQUEST, "仅支持 PDF 格式的书籍文件", False)
+
+        # 读取文件内容
+        file_content = file.read()
+        print(f"[上传] 文件大小: {len(file_content)} bytes")
+
+        # 计算文件哈希（用于去重）
+        file_hash = hashlib.md5(file_content).hexdigest()
+        cache_key = f"{BOOK_HASH_PREFIX}{file_hash}"
+        print(f"[上传] 文件哈希: {file_hash}")
+
+        # 检查是否已上传过
+        existing = book_redis.get(cache_key)
+        if existing:
+            print(f"[上传] 检测到重复上传: {existing}")
+            return create_response(
+                HTTPStatus.CONFLICT,
+                f"该书籍已上传过（{existing}），请勿重复上传",
+                False,
+                data={"book_name": existing}
+            )
+
+        # 上传到 RUSTFS
+        print(f"[上传] 上传到 RUSTFS: {file.filename}")
+        object_name = book_rag_service.rustfs.upload_book(file_content, file.filename)
+        print(f"[上传] RUSTFS 对象名: {object_name}")
+
+        # 处理书籍（切片 + 向量化）
+        print(f"[上传] 开始处理书籍: {book_name}")
+        chunk_count, error = book_rag_service.process_book(None, book_name, object_name)
+        print(f"[上传] 处理完成: chunk_count={chunk_count}, error={error}")
+
+        if error:
+            return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, error, False)
+
+        # 存入 Redis 缓存（30天过期）
+        book_redis.setex(cache_key, BOOK_HASH_TTL, book_name)
+        print(f"[上传] 已缓存书籍哈希: {book_name}")
+
+        return create_response(HTTPStatus.OK, "书籍上传成功", True, data={
+            "book_name": book_name,
+            "chunk_count": chunk_count
+        })
+
+    except Exception as e:
+        print(f"[上传] 上传失败: {e}")
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+# 获取书籍列表
+@app.route("/api/book/list/", methods=["GET"], strict_slashes=False)
+def list_books():
+    try:
+        books = book_rag_service.get_book_list()
+        return create_response(HTTPStatus.OK, "查询成功", True, data={
+            "books": books,
+            "total": len(books)
+        })
+    except Exception as e:
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+# 书籍 RAG 问答
+@app.route("/api/book/query/", methods=["POST"], strict_slashes=False)
+def query_book():
+    try:
+        data = request.get_json()
+        question = data.get('question')
+        book_name = data.get('book_name')  # 可选，指定书籍
+
+        if not question:
+            return create_response(HTTPStatus.BAD_REQUEST, "问题不能为空", False)
+
+        print(f"[问答] 问题: {question}, 书籍: {book_name}")
+
+        answer, chunks = book_rag_service.ask(question, book_name)
+        print(f"[问答] 回答: {answer[:100]}...")
+
+        # 构建参考来源
+        references = []
+        for chunk in chunks:
+            references.append({
+                "book_name": chunk['metadata'].get('book_name', '未知'),
+                "content": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content'],
+                "relevance_score": chunk.get('relevance_score', 0)
+            })
+
+        return create_response(HTTPStatus.OK, "查询成功", True, data={
+            "answer": answer,
+            "references": references
+        })
+
+    except Exception as e:
+        print(f"[问答] 失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
 
 if __name__ == '__main__':
