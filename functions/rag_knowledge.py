@@ -157,12 +157,12 @@ class DeviceKnowledgeBase:
                 runtime_distribution['长时运行(>20分钟)'] = runtime_distribution.get('长时运行(>20分钟)', 0) + 1
 
         summary = f"""设备 ID: {device_id}
-统计周期内运行次数: {total_runs} 次
-总运行时长: {total_runtime} 秒 ({total_runtime/3600:.2f} 小时)
-平均单次运行时长: {avg_runtime:.1f} 秒 ({avg_runtime/60:.1f} 分钟)
-正常运行（≤10分钟）次数: {len(normal_runs)} 次
-异常运行（>10分钟）次数: {len(abnormal_runs)} 次
-运行时长分布: {json.dumps(runtime_distribution, ensure_ascii=False, indent=2)}"""
+                统计周期内运行次数: {total_runs} 次
+                总运行时长: {total_runtime} 秒 ({total_runtime/3600:.2f} 小时)
+                平均单次运行时长: {avg_runtime:.1f} 秒 ({avg_runtime/60:.1f} 分钟)
+                正常运行（≤10分钟）次数: {len(normal_runs)} 次
+                异常运行（>10分钟）次数: {len(abnormal_runs)} 次
+                运行时长分布: {json.dumps(runtime_distribution, ensure_ascii=False, indent=2)}"""
 
         return summary
 
@@ -255,11 +255,11 @@ class DeviceKnowledgeBase:
                 content = f.read()
 
             config_info = """项目配置文件说明:
-- 数据库: PostgreSQL (jyaitech.pg.rds.aliyuncs.com:5432, 数据库名: upload_detection)
-- Redis: 1Panel-redis-vqLD:6379 (DB 7)
-- RUSTFS 对象存储: 43.136.37.113:9000
-- FRP 代理: 8.134.128.64:6000
-- AI 服务: DeepSeek API"""
+                - 数据库: PostgreSQL (jyaitech.pg.rds.aliyuncs.com:5432, 数据库名: upload_detection)
+                - Redis: 1Panel-redis-vqLD:6379 (DB 7)
+                - RUSTFS 对象存储: 43.136.37.113:9000
+                - FRP 代理: 8.134.128.64:6000
+                - AI 服务: DeepSeek API"""
 
             return config_info
         except Exception as e:
@@ -413,16 +413,16 @@ class RAGService:
         # 2. 构建 prompt
         prompt = f"""你是一个专业的设备管理助手，基于以下知识库内容回答用户问题。
 
-{context}
-
----
-用户问题: {question}
-
-请基于上述知识库内容回答，如果知识库中没有相关信息，请说明"根据当前知识库无法回答此问题"。
-回答要求：
-1. 准确、简洁
-2. 如有数据请引用具体数值
-3. 如涉及设备分析，给出建议"""
+            {context}
+            
+            ---
+            用户问题: {question}
+            
+            请基于上述知识库内容回答，如果知识库中没有相关信息，请说明"根据当前知识库无法回答此问题"。
+            回答要求：
+            1. 准确、简洁
+            2. 如有数据请引用具体数值
+            3. 如涉及设备分析，给出建议"""
 
         # 3. 调用 DeepSeek API
         try:

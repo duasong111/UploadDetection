@@ -263,17 +263,17 @@ def upload_book():
 
         # 读取文件内容
         file_content = file.read()
-        print(f"[上传] 文件大小: {len(file_content)} bytes")
+        # print(f"[上传] 文件大小: {len(file_content)} bytes")
 
         # 计算文件哈希（用于去重）
         file_hash = hashlib.md5(file_content).hexdigest()
         cache_key = f"{BOOK_HASH_PREFIX}{file_hash}"
-        print(f"[上传] 文件哈希: {file_hash}")
+        # print(f"[上传] 文件哈希: {file_hash}")
 
         # 检查是否已上传过
         existing = book_redis.get(cache_key)
         if existing:
-            print(f"[上传] 检测到重复上传: {existing}")
+            # print(f"[上传] 检测到重复上传: {existing}")
             return create_response(
                 HTTPStatus.CONFLICT,
                 f"该书籍已上传过（{existing}），请勿重复上传",
@@ -282,21 +282,21 @@ def upload_book():
             )
 
         # 上传到 RUSTFS
-        print(f"[上传] 上传到 RUSTFS: {file.filename}")
+        # print(f"[上传] 上传到 RUSTFS: {file.filename}")
         object_name = book_rag_service.rustfs.upload_book(file_content, file.filename)
-        print(f"[上传] RUSTFS 对象名: {object_name}")
+        # print(f"[上传] RUSTFS 对象名: {object_name}")
 
         # 处理书籍（切片 + 向量化）
-        print(f"[上传] 开始处理书籍: {book_name}")
+        # print(f"[上传] 开始处理书籍: {book_name}")
         chunk_count, error = book_rag_service.process_book(None, book_name, object_name)
-        print(f"[上传] 处理完成: chunk_count={chunk_count}, error={error}")
+        # print(f"[上传] 处理完成: chunk_count={chunk_count}, error={error}")
 
         if error:
             return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, error, False)
 
         # 存入 Redis 缓存（30天过期）
         book_redis.setex(cache_key, BOOK_HASH_TTL, book_name)
-        print(f"[上传] 已缓存书籍哈希: {book_name}")
+        # print(f"[上传] 已缓存书籍哈希: {book_name}")
 
         return create_response(HTTPStatus.OK, "书籍上传成功", True, data={
             "book_name": book_name,
@@ -304,7 +304,7 @@ def upload_book():
         })
 
     except Exception as e:
-        print(f"[上传] 上传失败: {e}")
+        # print(f"[上传] 上传失败: {e}")
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
 # 获取书籍列表
@@ -330,10 +330,10 @@ def query_book():
         if not question:
             return create_response(HTTPStatus.BAD_REQUEST, "问题不能为空", False)
 
-        print(f"[问答] 问题: {question}, 书籍: {book_name}")
+        # print(f"[问答] 问题: {question}, 书籍: {book_name}")
 
         answer, chunks = book_rag_service.ask(question, book_name)
-        print(f"[问答] 回答: {answer[:100]}...")
+        # print(f"[问答] 回答: {answer[:100]}...")
 
         # 构建参考来源
         references = []
@@ -350,7 +350,7 @@ def query_book():
         })
 
     except Exception as e:
-        print(f"[问答] 失败: {e}")
+        # print(f"[问答] 失败: {e}")
         import traceback
         traceback.print_exc()
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
