@@ -1,10 +1,12 @@
 from flask_socketio import SocketIO, emit
 from Common.Response import create_response
 from flask import Flask, request
+from functions.duration_stastic import ControlDurationTime,AddDurationTime
 from functions.user import LoginFunction, RegisterFunction, UserContributionView, ChangePasswordView
 from functions.device import ListDevicesView, QueryDeviceOnlineHistoryView, StaticRunTimeView
-from functions.frp import QueryFrpDeviceUptimeView,UpdateFrpConfigView,UpdateN2NConfigView
+from functions.frp import QueryFrpDeviceUptimeView,UpdateFrpConfigView,UpdateN2NConfigView,AddFrp
 from functions.ssh_config import AddLicenseView, BatchDeployView
+
 from functions.device_query import QueryDeviceView
 from functions.avatar import AvatarManager
 from functions.ai_chat import ai_chat_view
@@ -230,6 +232,29 @@ app.add_url_rule(
     methods=['POST']
 )
 
+
+# 添加远程远程持久测试
+app.add_url_rule(
+    '/api/add_duration/',
+    view_func=AddDurationTime.as_view('add_duration'),
+    methods=['POST']
+)
+
+# 控制远程持久测试状态
+app.add_url_rule(
+    '/api/duration_status/',
+    view_func=ControlDurationTime.as_view('duration_status'),
+    methods=['POST']
+)
+
+# 新增前端可以直接控制设备去添加frp的功能
+app.add_url_rule(
+    '/api/add_frp/',
+    view_func=AddFrp.as_view('add_frp'),
+    methods=['POST']
+)
+
+
 # 用户贡献统计（每日登录次数）
 @app.route("/api/user_contributions/", methods=["POST"], strict_slashes=False)
 def user_contributions():
@@ -423,6 +448,7 @@ def firmware_delete():
     success, msg, _ = firmware_mgr.delete_firmware(filename)
     status = HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
     return create_response(status, msg, success)
+
 
 
 

@@ -1,6 +1,9 @@
 import os
+import time
 import socket
 import paramiko
+import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from flask.views import MethodView
@@ -19,6 +22,21 @@ from config import (
     COMMAND_TIMEOUT,
     CONFIG_FILE
 )
+
+# FRPC 相关配置（从 config 导入，带默认值）
+try:
+    from config import FRPC_SERVER_ADDR, FRPC_SERVER_PORT, FRPC_AUTH_TOKEN, FRPC_BINARY_PATH
+except ImportError:
+    FRPC_SERVER_ADDR = "8.134.128.64"
+    FRPC_SERVER_PORT = 7000
+    FRPC_AUTH_TOKEN = "token123456"
+    FRPC_BINARY_PATH = "/home/frp_0.61.1_linux_arm"
+
+# 异步 FRP 添加任务的状态跟踪
+_frp_task_status: dict[str, dict] = {}
+_frp_task_lock = threading.Lock()
+
+logger = logging.getLogger(__name__)
 
 
 def create_frp_socket(host: str):
@@ -105,8 +123,10 @@ def read_frp_hosts():
     except Exception:
         return []
 
+
 class QueryFrpDeviceUptimeView(MethodView):
     """查询 FRP 设备在线状态及 uptime（POST）"""
+
     def post(self):
         try:
             data = request.get_json() or {}
@@ -152,7 +172,7 @@ class QueryFrpDeviceUptimeView(MethodView):
                         "uptime": uptime_result,
                         "query_time": query_time.isoformat(),
                         "query_time_local": query_time.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
-                        "uptime_s": query_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")   # 新增字段
+                        "uptime_s": query_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")  # 新增字段
                     })
 
                     # 保存用于入库
@@ -243,6 +263,7 @@ class QueryFrpDeviceUptimeView(MethodView):
             if conn:
                 conn.close()
 
+
 class UpdateFrpConfigView(MethodView):
     """更新 FRP 设备配置文件（POST）"""
 
@@ -317,6 +338,7 @@ class UpdateFrpConfigView(MethodView):
                 False
             )
 
+
 class UpdateN2NConfigView(MethodView):
     """更新 FRP 设备配置文件（POST）"""
     CONFIG_FILE = "Common/config_n2n.txt"
@@ -383,3 +405,109 @@ class UpdateN2NConfigView(MethodView):
                 f"服务器错误: {str(e)}",
                 False
             )
+
+
+class AddFrp(MethodView):
+    """给已有的n2n设备新增frp配置"""
+
+    def post(self):
+        try:
+            # 获取前端传来的参数
+            data = request.get_json()
+            ip = data.get('ip')
+            password = data.get('password')
+            device_name = data.get('device_name')
+
+            if not all([ip, password, device_name]):
+                return create_response(HTTPStatus.BAD_REQUEST, "缺少必要参数: ip, password, device_name", False)
+
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            ssh.connect(
+                hostname=ip,
+                port=22,
+                username='root',
+                password=password,
+                timeout=15,
+                allow_agent=False,
+                look_for_keys=False
+            )
+
+            # ==================== 1. 写入 frpc.toml ====================
+            toml_content = f'''serverAddr = "8.134.128.64"
+serverPort = 7000
+auth.method = "token"
+auth.token = "token123456"
+
+[[proxies]]
+name = "{device_name}"
+type = "tcpmux"
+multiplexer = "httpconnect"
+customDomains = ["{device_name}"]
+localIP = "127.0.0.1"
+localPort = 22
+'''
+
+            # 使用 cat 覆盖写入 toml 文件
+            write_toml_cmd = f'''cat > /home/frp_0.61.1_linux_arm/frpc.toml << 'EOF'
+{toml_content}
+EOF'''
+
+            self._exec_command(ssh, write_toml_cmd, "写入 frpc.toml")
+
+            # ==================== 2. 写入 frpc.service ====================
+            service_content = '''[Unit]
+Description=FRP Client Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/frp_0.61.1_linux_arm/frpc -c /home/frp_0.61.1_linux_arm/frpc.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StartLimitInterval=0
+KillMode=mixed
+TimeoutStopSec=10
+Environment=GOMAXPROCS=1
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+            write_service_cmd = f'''cat > /etc/systemd/system/frpc.service << 'EOF'
+{service_content}
+EOF'''
+
+            self._exec_command(ssh, f"sudo {write_service_cmd}", "写入 frpc.service")
+
+            # ==================== 3. 执行后续 systemd 操作 ====================
+            commands = [
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable frpc.service",
+                "sudo systemctl restart frpc.service",
+                "sudo systemctl status frpc.service --no-pager"
+            ]
+
+            for cmd in commands:
+                self._exec_command(ssh, cmd, f"执行: {cmd}")
+
+            ssh.close()
+            return create_response(HTTPStatus.OK, f"FRP 配置添加成功，设备名称: {device_name}", True)
+
+        except paramiko.AuthenticationException:
+            return create_response(HTTPStatus.UNAUTHORIZED, "SSH认证失败，请检查密码", False)
+        except paramiko.SSHException as e:
+            return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"SSH连接失败: {str(e)}", False)
+        except Exception as e:
+            return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"添加FRP配置失败: {str(e)}", False)
+
+    def _exec_command(self, ssh, command, desc="执行命令"):
+        """封装执行命令并打印日志"""
+        # print(f"[{desc}] 执行: {command}")
+        stdin, stdout, stderr = ssh.exec_command(command)
+        out = stdout.read().decode('utf-8', errors='ignore')
+        err = stderr.read().decode('utf-8', errors='ignore')
+        time.sleep(0.5)  # 给系统一点缓冲时间
