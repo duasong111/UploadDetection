@@ -67,10 +67,28 @@ def get_weather(city: str) -> str:
 def get_tools():
     """获取天气工具 schema 列表（OpenAI function calling 格式）"""
     tool_obj = get_weather
+    raw_schema = tool_obj.args_schema.model_json_schema()
+
+    # 提取 properties 和 required，过滤掉 parameters 里的顶层多余字段
+    properties = raw_schema.get("properties", {})
+    required = raw_schema.get("required", [])
+
+    # 清理每个 property 里可能有的 description（保留在顶层）
+    cleaned_properties = {}
+    for k, v in properties.items():
+        if isinstance(v, dict):
+            cleaned_properties[k] = {"type": v.get("type", "string")}
+        else:
+            cleaned_properties[k] = v
+
     schema = {
         "name": tool_obj.name,
         "description": tool_obj.description,
-        "parameters": tool_obj.args_schema.model_json_schema()
+        "parameters": {
+            "type": "object",
+            "properties": cleaned_properties,
+            "required": required
+        }
     }
     return [{
         "type": "function",

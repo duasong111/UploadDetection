@@ -19,6 +19,16 @@ def string_schema(description: str, example: str = None) -> dict:
         schema["description"] += f"，例如：{example}"
     return schema
 
+
+def number_schema(description: str, example: float = None) -> dict:
+    schema = {
+        "type": "number",
+        "description": description
+    }
+    if example is not None:
+        schema["description"] += f"，例如：{example}"
+    return schema
+
 # 整数类型 schema
 def integer_schema(description: str, example: int = None) -> dict:
     schema = {

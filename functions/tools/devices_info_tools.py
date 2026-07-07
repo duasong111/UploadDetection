@@ -71,12 +71,17 @@ def get_all_devices():
         }
 
 
-def get_device_status(device_sn: str):
+def get_device_status(device_sn: str = None):
     """
     查询指定设备的状态（带缓存）
-    :param device_sn: 设备序列号
+    :param device_sn: 设备序列号，如不提供则返回说明
     :return: 设备详细信息
     """
+    if not device_sn:
+        return {
+            "success": False,
+            "message": "device_sn 参数缺失，请在调用时提供设备序列号"
+        }
     try:
         cache_key = f"{CACHE_KEY_DEVICE_STATUS}{device_sn}"
 
@@ -115,13 +120,18 @@ def get_device_status(device_sn: str):
         }
 
 
-def get_device_history(device_sn: str, number: int = 10):
+def get_device_history(device_sn: str = None, number: int = 10):
     """
     查询指定设备的运行历史（带缓存）
-    :param device_sn: 设备序列号
+    :param device_sn: 设备序列号，如不提供则返回所有设备的历史记录概要
     :param number: 返回记录数，默认10条
     :return: 设备运行历史列表
     """
+    if not device_sn:
+        return {
+            "success": False,
+            "message": "device_sn 参数缺失，请在调用时提供设备序列号"
+        }
     try:
         cache_key = f"{CACHE_KEY_DEVICE_HISTORY}{device_sn}:{number}"
 
@@ -245,7 +255,7 @@ DEVICE_TOOLS = [
         parameters={
             "device_sn": string_schema("设备序列号", "303、118")
         },
-        required=["device_sn"]
+        required=[]
     ),
     build_function_schema(
         name="get_device_history",
@@ -254,7 +264,7 @@ DEVICE_TOOLS = [
             "device_sn": string_schema("设备序列号", "303"),
             "number": integer_schema("返回记录数量", 10)
         },
-        required=["device_sn"]
+        required=[]
     ),
     build_function_schema(
         name="get_device_statistics",

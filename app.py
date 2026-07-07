@@ -23,7 +23,7 @@ config = Configuration()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_interval=25, ping_timeout=60)
 
 # ==================== 书籍 RAG 接口 ====================
 from functions.book_rag import book_rag_service
@@ -50,10 +50,16 @@ def handle_disconnect():
     print(f"客户端断开: {request.sid}")
 
 
+@socketio.on('ping_server')
+def handle_ping():
+    """心跳检测"""
+    emit('pong', {'time': None})
+
+
 @socketio.on('ai_chat')
 def handle_ai_chat(data):
     """处理 AI 聊天 WebSocket 事件"""
-    from functions.ai_chat import ai_chat_view
+    from functions.ai_chat import AIChatView
 
     message = data.get('message')
     history = data.get('history', [])
@@ -63,11 +69,34 @@ def handle_ai_chat(data):
         emit('ai_response', {'success': False, 'message': '消息内容不能为空'})
         return
 
-    # 调用 AI
-    result, success = ai_chat_view.chat(message, history, username)
+    print(f"[WS] emit ai_stream_start")
+    emit('ai_stream_start', {'status': 'started'})
 
-    # 通过 WebSocket 发送结果
-    emit('ai_response', result)
+    chat_view = AIChatView()
+    emitted_tokens = 0
+
+    def stream_callback(chunk: str, is_final: bool):
+        nonlocal emitted_tokens
+        if chunk:
+            emit('ai_stream_token', {'token': chunk})
+            emitted_tokens += 1
+            if emitted_tokens <= 3:
+                print(f"[WS] emit token: {repr(chunk)}")
+
+    print(f"[WS] calling chat_streaming...")
+    answer, success, tool_calls_info, daily_usage = chat_view.chat_streaming(
+        message, history, username, stream_callback=stream_callback
+    )
+    print(f"[WS] chat_streaming done. answer_len={len(answer)}, emitted_tokens={emitted_tokens}, success={success}")
+
+    print(f"[WS] emit ai_stream_end")
+    emit('ai_stream_end', {
+        'answer': answer,
+        'tool_calls': tool_calls_info,
+        'success': success,
+        'daily_usage': daily_usage,
+        'daily_limit': 10
+    })
 
 # 不计入请求统计的接口
 EXCLUDED_PATHS = {'/api/login/', '/api/register/', '/api/user_contributions/'}
