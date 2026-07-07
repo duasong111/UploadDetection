@@ -8,8 +8,13 @@ from functions.ssh_config import AddLicenseView, BatchDeployView
 from functions.device_query import QueryDeviceView
 from functions.avatar import AvatarManager
 from functions.ai_chat import ai_chat_view
+from functions.firmware import FirmwareManager
 from database.operateFunction import execuFunction
 from functions.transmission import Configuration
+from functions.book_rag import book_rag_service
+import redis
+import hashlib
+from config import REDIS_URL
 from flask_cors import CORS
 from http import HTTPStatus
 checkLogin = LoginFunction()
@@ -25,24 +30,21 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_interval=25, ping_timeout=60)
 
+# 注册固件管理蓝图
+firmware_mgr = FirmwareManager()
+
+
 # ==================== 书籍 RAG 接口 ====================
-from functions.book_rag import book_rag_service
-import redis
-import hashlib
-from config import REDIS_URL
 
 book_redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 BOOK_HASH_PREFIX = "book:hash:"  # 书籍文件哈希缓存前缀
 BOOK_HASH_TTL = 86400 * 30  # 30天过期
 
-
 # ==================== WebSocket 事件 ====================
 @socketio.on('connect')
 def handle_connect():
     """客户端连接"""
-    print(f"客户端连接: {request.sid}")
     emit('connected', {'sid': request.sid})
-
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -69,7 +71,6 @@ def handle_ai_chat(data):
         emit('ai_response', {'success': False, 'message': '消息内容不能为空'})
         return
 
-    print(f"[WS] emit ai_stream_start")
     emit('ai_stream_start', {'status': 'started'})
 
     chat_view = AIChatView()
@@ -83,13 +84,10 @@ def handle_ai_chat(data):
             if emitted_tokens <= 3:
                 print(f"[WS] emit token: {repr(chunk)}")
 
-    print(f"[WS] calling chat_streaming...")
     answer, success, tool_calls_info, daily_usage = chat_view.chat_streaming(
         message, history, username, stream_callback=stream_callback
     )
-    print(f"[WS] chat_streaming done. answer_len={len(answer)}, emitted_tokens={emitted_tokens}, success={success}")
 
-    print(f"[WS] emit ai_stream_end")
     emit('ai_stream_end', {
         'answer': answer,
         'tool_calls': tool_calls_info,
@@ -100,6 +98,7 @@ def handle_ai_chat(data):
 
 # 不计入请求统计的接口
 EXCLUDED_PATHS = {'/api/login/', '/api/register/', '/api/user_contributions/'}
+
 
 @app.before_request
 def track_request_count():
@@ -209,6 +208,7 @@ app.add_url_rule(
     view_func=Configuration.as_view('quick_configuration'),
     methods=['POST']
 )
+
 # 远程增加鉴权文件
 app.add_url_rule(
     '/api/add_license/',
@@ -268,15 +268,6 @@ def get_avatar(filename):
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
 
-# AI 聊天接口
-app.add_url_rule(
-    '/api/ai_chat/',
-    view_func=ai_chat_view,
-    methods=['POST']
-)
-
-
-
 # 上传书籍
 @app.route("/api/book/upload/", methods=["POST"], strict_slashes=False)
 def upload_book():
@@ -292,17 +283,14 @@ def upload_book():
 
         # 读取文件内容
         file_content = file.read()
-        # print(f"[上传] 文件大小: {len(file_content)} bytes")
 
         # 计算文件哈希（用于去重）
         file_hash = hashlib.md5(file_content).hexdigest()
         cache_key = f"{BOOK_HASH_PREFIX}{file_hash}"
-        # print(f"[上传] 文件哈希: {file_hash}")
 
         # 检查是否已上传过
         existing = book_redis.get(cache_key)
         if existing:
-            # print(f"[上传] 检测到重复上传: {existing}")
             return create_response(
                 HTTPStatus.CONFLICT,
                 f"该书籍已上传过（{existing}），请勿重复上传",
@@ -313,19 +301,16 @@ def upload_book():
         # 上传到 RUSTFS
         # print(f"[上传] 上传到 RUSTFS: {file.filename}")
         object_name = book_rag_service.rustfs.upload_book(file_content, file.filename)
-        # print(f"[上传] RUSTFS 对象名: {object_name}")
 
         # 处理书籍（切片 + 向量化）
         # print(f"[上传] 开始处理书籍: {book_name}")
         chunk_count, error = book_rag_service.process_book(None, book_name, object_name)
-        # print(f"[上传] 处理完成: chunk_count={chunk_count}, error={error}")
 
         if error:
             return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, error, False)
 
         # 存入 Redis 缓存（30天过期）
         book_redis.setex(cache_key, BOOK_HASH_TTL, book_name)
-        # print(f"[上传] 已缓存书籍哈希: {book_name}")
 
         return create_response(HTTPStatus.OK, "书籍上传成功", True, data={
             "book_name": book_name,
@@ -333,7 +318,6 @@ def upload_book():
         })
 
     except Exception as e:
-        # print(f"[上传] 上传失败: {e}")
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
 
 # 获取书籍列表
@@ -383,6 +367,63 @@ def query_book():
         import traceback
         traceback.print_exc()
         return create_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务器错误: {str(e)}", False)
+
+
+# AI 聊天接口
+app.add_url_rule(
+    '/api/ai_chat/',
+    view_func=ai_chat_view,
+    methods=['POST']
+)
+
+
+
+@app.route("/api/firmware/upload/", methods=["POST"], strict_slashes=False)
+def firmware_upload():
+    if request.content_type and "multipart/form-data" in request.content_type:
+        if "file" not in request.files:
+            return create_response(HTTPStatus.BAD_REQUEST, "未找到文件字段", False)
+        file = request.files["file"]
+        if not file.filename:
+            return create_response(HTTPStatus.BAD_REQUEST, "文件名为空", False)
+        file_data = file.read()
+        filename = file.filename
+    else:
+        if not request.data:
+            return create_response(HTTPStatus.BAD_REQUEST, "请求体为空", False)
+        file_data = request.data
+        filename = request.args.get("filename") or "firmware.bin"
+    success, msg, data = firmware_mgr.upload_firmware(file_data, filename)
+    status = HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    return create_response(status, msg, success, data=data)
+
+
+@app.route("/api/firmware/download/", methods=["GET"], strict_slashes=False)
+def firmware_download():
+    filename = request.args.get("filename")
+    if not filename:
+        return create_response(HTTPStatus.BAD_REQUEST, "filename required", False)
+    username = request.args.get("username")
+    resp, status = firmware_mgr.download_firmware(filename, username)
+    return resp, status
+
+
+@app.route("/api/firmware/list/", methods=["GET"], strict_slashes=False)
+def firmware_list():
+    result = firmware_mgr.list_firmware()
+    return create_response(HTTPStatus.OK, "success", True, data=result)
+
+
+@app.route("/api/firmware/delete/", methods=["POST"], strict_slashes=False)
+def firmware_delete():
+    data = request.get_json() or {}
+    filename = data.get("filename")
+    if not filename:
+        return create_response(HTTPStatus.BAD_REQUEST, "filename required", False)
+    success, msg, _ = firmware_mgr.delete_firmware(filename)
+    status = HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    return create_response(status, msg, success)
+
 
 
 if __name__ == '__main__':
