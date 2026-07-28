@@ -1,0 +1,14 @@
+---
+- name: 执行远程命令
+  hosts: cameras
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: 执行命令
+      command: "{{ cmd }}"
+      register: result
+
+    - name: 显示命令输出
+      debug:
+        var: result.stdout_lines

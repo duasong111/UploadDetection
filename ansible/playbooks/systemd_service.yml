@@ -1,0 +1,24 @@
+---
+- name: 管理 Systemd 服务
+  hosts: cameras
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: 写入服务文件
+      copy:
+        content: "{{ service_content }}"
+        dest: "{{ service_path }}"
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: 重载 systemd 守护进程
+      systemd:
+        daemon_reload: yes
+
+    - name: "{{ service_action | default('start') }} 服务"
+      systemd:
+        name: "{{ service_name }}"
+        enabled: "{{ service_enabled | default(true) }}"
+        state: "{{ service_state | default('started') }}"

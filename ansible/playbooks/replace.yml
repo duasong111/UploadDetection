@@ -1,0 +1,24 @@
+---
+- name: 替换远程文件
+  hosts: cameras
+  become: yes
+  gather_facts: no
+
+  vars:
+    remote_path: "{{ target_path }}"
+    file_mode: "{{ file_mode | default('0644') }}"
+
+  tasks:
+    - name: 创建目标目录
+      file:
+        path: "{{ remote_path | dirname }}"
+        state: directory
+        mode: '0755'
+
+    - name: 写入文件内容
+      copy:
+        content: "{{ file_content }}"
+        dest: "{{ remote_path }}"
+        mode: "{{ file_mode }}"
+        owner: root
+        group: root
