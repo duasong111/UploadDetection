@@ -19,7 +19,7 @@ __pycache__/
 # 环境变量和敏感信息
 .env
 *.env
-config.local.py
+config.py
 
 # 日志和临时文件
 *.log
