@@ -1,23 +1,35 @@
 # UploadDetection 设备上传检测系统
 
-基于 Flask 的设备运行时长上报与管理系统，支持设备注册、运行时长统计、在线状态监控等功能。
+基于 FastAPI 的设备运行时长上报与管理系统，支持设备注册、运行时长统计、在线状态监控、AI 聊天、RAG 知识库等功能。
 
 ## 技术栈
 
-- **后端框架**: Flask 3.x
+- **后端框架**: FastAPI 0.109+ + Socket.IO
 - **数据库**: PostgreSQL 15+
 - **缓存**: Redis 7.x
-- **部署**: Docker + Gunicorn
-- **其他**: Flask-CORS, Flask-SocketIO, psycopg2, bcrypt, paramiko
+- **向量数据库**: ChromaDB (RAG 知识库)
+- **对象存储**: MinIO / RUSTFS (文件、头像、固件存储)
+- **自动化运维**: Ansible (Playbook 批量部署)
+- **AI 集成**: DeepSeek Chat + Tool Calling + RAG
+- **文件上传**: 分片上传 + 断点续传 + ClamAV 病毒扫描
+- **远程设备管理**: SSH + Paramiko + WebSocket Agent
+- **容器化部署**: Docker + Uvicorn
 
 ## 功能特性
 
-- ✅ 用户登录/注册
-- ✅ 设备运行时长上报
-- ✅ 设备在线状态监控
-- ✅ 设备列表管理
-- ✅ FRP 设备配置管理
-- ✅ 运行时长统计
+- ✅ 用户登录/注册 & 头像管理
+- ✅ 设备运行时长上报 & 在线状态监控
+- ✅ 设备列表管理 & 历史数据查询
+- ✅ FRP 设备配置管理 & N2N 组网
+- ✅ 远程 SSH 部署（授权文件、批量部署）
+- ✅ Ansible 自动化运维（Playbook 批量执行）
+- ✅ 运行时长统计 & 可视化
+- ✅ 安全文件上传（分片上传、断点续传、ClamAV 病毒扫描）
+- ✅ 固件管理（上传、下载、去重、版本管理）
+- ✅ AI 智能聊天（Tool Calling / Function Call / Agent Loop）
+- ✅ RAG 知识库（书籍 RAG + 设备知识库）
+- ✅ WebSocket Agent 远程设备控制
+- ✅ 用户操作频率限制（License 管理、全局速率控制）
 
 ## 快速开始
 
@@ -35,28 +47,14 @@ pip install -r requirements.txt
 
 ### 配置文件
 
-修改 `config.py` 文件，配置数据库和 Redis 连接：
+1. 复制 `config.example.py` 为 `config.py`：
+   ```bash
+   cp config.example.py config.py
+   ```
 
-```python
-# 数据库配置
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'postgres',
-        'USER': 'postgres',
-        'PASSWORD': 'your_password',
-        'HOST': '10.1.1.127',
-        'PORT': '5432',
-    }
-}
+2. 修改 `config.py` 中的敏感配置（数据库、Redis、AI Key 等）
 
-# Redis 配置
-REDIS_HOST = "10.1.1.197"
-REDIS_PORT = 6379
-REDIS_PASSWORD = "your_password"
-REDIS_DB = 5
-REDIS_URL = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
-```
+> ⚠️ **重要**: `config.py` 包含敏感信息，已被 `.gitignore` 排除，不会提交到 GitHub。
 
 ### 运行服务
 
@@ -171,21 +169,70 @@ docker run -d -p 5000:5000 --name uploaddetection-container uploaddetection
 ## 项目结构
 
 ```
-├── app.py                 # 主应用入口
-├── config.py              # 配置文件
-├── requirements.txt       # 依赖列表
-├── Dockerfile             # Docker 配置
-├── database/              # 数据库模块
-│   ├── Postgresql.py      # PostgreSQL 连接
-│   └── operateFunction.py # 数据库操作封装
-├── functions/             # 业务逻辑模块
-│   ├── user.py            # 用户相关功能
-│   ├── device.py          # 设备相关功能
-│   ├── frp.py             # FRP 相关功能
-│   └── check.py           # 密码校验
-├── Common/                # 公共模块
-│   └── Response.py        # 统一响应封装
-└── migrations/            # 数据库迁移脚本
+├── app.py                    # FastAPI 主入口，纯路由层
+├── config.example.py         # 配置文件模板（替代 config.py 提交到 Git）
+├── requirements.txt          # 依赖列表
+├── Dockerfile                # Docker 容器化部署
+├── CLAUDE.md                 # AI 编码约束文档
+│
+├── functions/                # 业务逻辑模块（核心）
+│   ├── user.py               # 用户注册/登录/改密
+│   ├── avatar.py             # 用户头像上传（MinIO 对象存储）
+│   ├── device_api.py         # 设备 API 管理
+│   ├── device.py             # 设备数据处理
+│   ├── device_query.py       # 设备高级查询
+│   ├── frp_api.py            # FRP 代理配置 API
+│   ├── frp.py                # FRP 核心业务逻辑（配置生成、推送到服务器）
+│   ├── ssh_api.py            # SSH 远程操作（授权文件部署、批量部署）
+│   ├── ssh_config.py         # SSH 配置管理（License 部署日志）
+│   ├── ansible_tasks.py      # Ansible 自动化运维调度
+│   ├── transmission.py       # 远程设备配置传输（N2N 组网、FRPC 部署）
+│   ├── duration_stastic.py   # 运行时长统计（部署 duration_time 脚本）
+│   │
+│   ├── upload_manager.py     # 安全文件上传（分片上传、断点续传、病毒扫描）
+│   ├── firmware.py           # 固件管理（上传/下载/去重/限流）
+│   │
+│   ├── ai_chat.py            # AI 智能聊天（流式响应 + Tool Calling）
+│   ├── book_rag.py           # 书籍 RAG 知识库（PDF 切片 → ChromaDB 向量检索）
+│   ├── rag_knowledge.py      # 设备知识库 RAG（TF-IDF + ChromaDB）
+│   │
+│   ├── check.py              # 密码强度校验
+│   └── tools/                # AI Tool Calling 工具集
+│       ├── devices_info_tools.py    # 设备信息查询工具（带 Redis 缓存）
+│       ├── schema.py                # Tool Schema 统一构建器
+│       └── tools_calling_export.py  # 工具统一导出
+│
+├── ansible/                  # Ansible 自动化运维
+│   ├── ansible.cfg           # Ansible 配置
+│   ├── inventory.ini         # 主机清单
+│   ├── hosts_pass.txt        # 主机密码文件
+│   └── playbooks/            # Playbook 剧本
+│       ├── execute_command.yml     # 远程命令执行
+│       ├── replace.yml             # 文件替换
+│       └── systemd_service.yml     # Systemd 服务管理
+│
+├── Common/                   # 公共模块
+│   ├── Response.py           # 统一响应封装
+│   ├── ssh.py                # SSH 远程连接 2.0（WebSocket Agent）
+│   └── duration_time.py      # 设备端运行时长上报脚本
+│
+├── database/                 # 数据库模块
+│   ├── Postgresql.py         # PostgreSQL 连接池
+│   └── operateFunction.py    # 数据库操作封装
+│
+├── chroma_data/              # ChromaDB 向量数据库存储（.gitignore 排除）
+│
+├── migrations/               # 数据库迁移脚本
+│   ├── create_device_table.py       # 设备表创建
+│   ├── config_setting.py            # 配置设置表
+│   ├── 003_create_frp_device_tables.py  # FRP 设备表
+│   └── 004_devices_revord.py        # 设备记录表
+│
+├── uploads/                  # 上传文件临时目录
+│   ├── temp/                 # 分片上传临时存储
+│   └── quarantine/           # ClamAV 隔离区
+│
+└── .github/                  # GitHub 工作流配置
 ```
 
 ## 数据库表结构
