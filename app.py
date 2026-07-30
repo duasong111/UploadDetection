@@ -15,11 +15,11 @@ from fastapi.responses import JSONResponse, Response
 
 from config import REDIS_URL, CODE_ERROR
 from Common.Response import create_response, create_ai_response, create_error_response
-from functions.book_rag import book_rag_service
+from functions.ai.book_rag import book_rag_service
 from functions.firmware import FirmwareManager
-from functions.device_api import list_devices, query_device_history, save_runtime, query_device
-from functions.frp_api import query_frp_uptime, update_frp_config, update_n2n_config, add_frp
-from functions.ssh_api import add_license, batch_deploy, add_duration, control_duration, quick_configuration
+from functions.device.device import list_devices, query_device_history, save_runtime, query_device
+from functions.frp.frp_api import query_frp_uptime, update_frp_config, update_n2n_config, add_frp
+from functions.ssh.ssh_api import add_license, batch_deploy, add_duration, control_duration, quick_configuration
 import redis
 
 # ==================== 应用初始化 ====================
@@ -49,7 +49,7 @@ async def ping_server(sid):
 
 @sio.event
 async def ai_chat(sid, data):
-    from functions.ai_chat import AIChatView
+    from functions.ai.ai_chat import AIChatView
     message, history, username = data.get('message'), data.get('history', []), data.get('username')
     if not message:
         await socket_app.emit('ai_response', {'success': False, 'message': '消息内容不能为空'}, room=sid)
@@ -343,7 +343,7 @@ async def api_firmware_delete(request: Request):
 # ==================== AI 聊天 ====================
 @app.post("/api/ai_chat/")
 async def api_ai_chat(request: Request):
-    from functions.ai_chat import AIChatView
+    from functions.ai.ai_chat import AIChatView
     data = await request.json()
     message, history, username = data.get("message"), data.get("history", []), data.get("username")
     if not message: return create_error_response("Message required", CODE_ERROR)
@@ -367,7 +367,7 @@ async def api_ai_chat(request: Request):
 @app.post("/api/ansible/replace/")
 async def ansible_replace(request: Request):
     """替换远程文件"""
-    from functions.ansible_tasks import ansible_runner
+    from functions.ansible.ansible_tasks import ansible_runner
     data = await request.json()
     hosts = data.get('hosts', [])
     target_path = data.get('target_path')
@@ -388,7 +388,7 @@ async def ansible_replace(request: Request):
 @app.post("/api/ansible/service/")
 async def ansible_service(request: Request):
     """管理 Systemd 服务"""
-    from functions.ansible_tasks import ansible_runner
+    from functions.ansible.ansible_tasks import ansible_runner
     data = await request.json()
     hosts = data.get('hosts', [])
     service_name = data.get('service_name')
@@ -411,7 +411,7 @@ async def ansible_service(request: Request):
 @app.post("/api/ansible/command/")
 async def ansible_command(request: Request):
     """执行远程命令"""
-    from functions.ansible_tasks import ansible_runner
+    from functions.ansible.ansible_tasks import ansible_runner
     data = await request.json()
     hosts = data.get('hosts', [])
     cmd = data.get('cmd')
@@ -429,7 +429,7 @@ async def ansible_command(request: Request):
 @app.post("/api/ansible/test/")
 async def ansible_test(request: Request):
     """测试 Ansible 连接"""
-    from functions.ansible_tasks import ansible_runner
+    from functions.ansible.ansible_tasks import ansible_runner
     data = await request.json()
     hosts = data.get('hosts', [])
 
