@@ -9,9 +9,9 @@ from typing import Dict, Any, Optional
 from database.Postgresql import get_postgres_connection
 from Common.Response import create_response
 from config import REDIS_URL
+from functions.device.device_heartbeat import is_online, get_heartbeat
 import redis
 
-BEIJING_OFFSET = timedelta(hours=8)
 DEVICE_LIST_CACHE_KEY = "device:list:all"
 DEVICE_LIST_CACHE_TTL = 30
 DEVICE_HISTORY_CACHE_PREFIX = "device:history:"
@@ -39,6 +39,7 @@ def list_devices() -> Dict:
         pass
 
     # 查询数据库
+    # 本机是 UTC，DB 存的是 UTC —— 直接按服务器本地时间（UTC）判定与显示
     now_server = datetime.now()
     yesterday = now_server - timedelta(days=1)
     today_start = now_server.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -62,19 +63,22 @@ def list_devices() -> Dict:
         today_new_count = 0
 
         def to_local(dt):
+            """服务器本地时间（UTC）：DB 存什么就显示什么，不做时区偏移"""
             if dt is None:
                 return None
             if dt.tzinfo is not None:
                 dt = dt.replace(tzinfo=None)
-            return dt + BEIJING_OFFSET
+            return dt
 
         for row in rows:
             created_at = to_local(row[2])
             last_report = to_local(row[3])
-            is_online = last_report is not None and last_report >= yesterday
+            # 在线判定：Redis 心跳优先（实时），无心跳时回退到 24 小时内有上报（DB 兜底）
+            online_heartbeat = is_online(row[1])
+            is_online_flag = online_heartbeat if online_heartbeat is not None else (last_report is not None and last_report >= yesterday)
             is_today_new = created_at is not None and created_at >= today_start
 
-            if is_online:
+            if is_online_flag:
                 online_count += 1
             else:
                 offline_count += 1
@@ -87,7 +91,8 @@ def list_devices() -> Dict:
                 "created_at_local": created_at.strftime("%Y-%m-%d %H:%M:%S") if created_at else None,
                 "last_report": last_report.isoformat() if last_report else None,
                 "last_report_local": last_report.strftime("%Y-%m-%d %H:%M:%S") if last_report else None,
-                "is_online": is_online,
+                "last_heartbeat": get_heartbeat(row[1]),
+                "is_online": is_online_flag,
                 "is_today_new": is_today_new
             })
 
@@ -141,11 +146,12 @@ def query_device_history(sn: str, n: int) -> Dict:
         records = []
         for row in rows:
             def format_dt(dt):
+                """服务器本地时间（UTC）：DB 存什么就显示什么，不做时区偏移"""
                 if dt is None:
                     return None
                 if dt.tzinfo is not None:
                     dt = dt.replace(tzinfo=None)
-                return (dt + BEIJING_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
 
             records.append({
                 "uuid": row[0],
@@ -176,10 +182,8 @@ def query_device_history(sn: str, n: int) -> Dict:
 
 
 def save_runtime(sn: str, uuid_val: str, runtime: int) -> Dict:
-    """保存设备运行时长"""
-    r = _redis_client
+    """保存设备运行时长（降级兜底路径：MQ 不可用时直写数据库）"""
     now_local = datetime.now()
-    key = f"runtime:{sn}:{uuid_val}"
 
     conn = get_postgres_connection()
     try:
@@ -213,19 +217,15 @@ def save_runtime(sn: str, uuid_val: str, runtime: int) -> Dict:
                 db_last_time = row[1].isoformat()
                 db_max_runtime = row[2]
 
-        # 更新缓存
+        # 更新缓存（仅失效列表缓存，心跳由 device_heartbeat 模块管理）
         try:
-            pipe = r.pipeline()
-            pipe.set(key, json.dumps({
-                "max_runtime": db_max_runtime,
-                "first_report_time": db_first_time,
-                "last_report_time": now_local.isoformat()
-            }))
-            pipe.expire(key, 86400)
-            pipe.delete(DEVICE_LIST_CACHE_KEY)
-            pipe.execute()
+            r.delete(DEVICE_LIST_CACHE_KEY)
         except Exception:
             pass
+
+        # 刷新心跳，保持与 MQ 路径一致
+        from functions.device.device_heartbeat import refresh_heartbeat
+        refresh_heartbeat(sn)
 
         return create_response(200, "上报成功", True, {
             "status": "ok",

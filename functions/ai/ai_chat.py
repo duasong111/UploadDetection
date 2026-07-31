@@ -5,6 +5,7 @@ AI Chat 模块
 import requests
 import json
 import re
+import threading
 from flask.views import View
 from flask import request
 from http import HTTPStatus
@@ -108,14 +109,14 @@ def execute_tool_call(tool_call: dict) -> dict:
 def call_deepseek_streaming(messages: list, tools: list = None, max_iterations: int = 10,
                             stream_callback=None) -> tuple:
     """
-    Agent Loop: 支持流式输出 + 并行执行 + 循环调用工具直到完成
+    Agent Loop: 真流式（SSE）输出 + 并行执行 + 循环调用工具直到完成
 
     Args:
         messages: 消息列表
         tools: 工具列表
         max_iterations: 最大迭代次数
         stream_callback: 流式回调函数，接收 (chunk: str, is_final: bool)
-                        - chunk: 收到的文本片段
+                        - chunk: 收到的文本片段（SSE 增量，非逐字模拟）
                         - is_final: 是否是最终片段
 
     Returns:
@@ -136,7 +137,7 @@ def call_deepseek_streaming(messages: list, tools: list = None, max_iterations: 
         payload = {
             "model": DEEPSEEK_MODEL,
             "messages": messages,
-            "stream": False  # 非流式，tool_calls 完整
+            "stream": True  # 真流式：SSE 增量返回
         }
         if tools:
             payload["tools"] = tools
@@ -151,64 +152,80 @@ def call_deepseek_streaming(messages: list, tools: list = None, max_iterations: 
         if response.status_code != 200:
             return f"API error: {response.text}", False, tool_calls_info
 
-        # 非流式读取响应
+        # ============ 流式解析 SSE ============
         full_content = ""
-        assistant_message = {}
+        tool_calls_acc = {}  # index -> {id, type, function:{name, arguments}}（工具调用增量拼接）
 
-        result = response.json()
-        msg = result.get("choices", [{}])[0].get("message", {})
-        full_content = msg.get("content", "") or ""
-        tool_calls_data = msg.get("tool_calls", []) or []
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            try:
+                delta = data["choices"][0].get("delta", {})
+            except (KeyError, IndexError):
+                continue
+
+            # 文本增量：逐 chunk 触发流式回调（打字机效果）
+            content = delta.get("content")
+            if content:
+                full_content += content
+                if stream_callback:
+                    stream_callback(content, False)
+
+            # 工具调用增量：按 index 累积拼接（name/arguments 都是增量片段）
+            for tc in (delta.get("tool_calls") or []):
+                idx = tc.get("index", 0)
+                acc = tool_calls_acc.setdefault(idx, {
+                    "id": None, "type": "function", "function": {"name": "", "arguments": ""}
+                })
+                if tc.get("id"):
+                    acc["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    acc["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    acc["function"]["arguments"] += fn["arguments"]
 
         # 过滤掉工具执行标记
         full_content = re.sub(r'\[TOOL_[^\]]*\](?:\[[^\]]*\])?', '', full_content).strip()
         full_content = re.sub(r'\[TOOL_COMPLETE\]', '', full_content).strip()
         full_content = re.sub(r'\[TOOL_ERROR\][^\[]*', '', full_content).strip()
 
-        # 逐字触发流式回调
-        if stream_callback and full_content:
-            for char in full_content:
-                stream_callback(char, False)
-
-        for tc in tool_calls_data:
-            if not tc or not tc.get("id"):
-                continue
-            func = tc.get("function") or {}
-            if not func.get("name"):
-                continue
-            assistant_message.setdefault("tool_calls", [])
-            assistant_message["tool_calls"].append({
-                "id": tc.get("id"),
-                "type": "function",
-                "function": {"name": func["name"], "arguments": func.get("arguments") or "{}"}
-            })
+        # 组装 assistant_message 的 tool_calls（只保留完整片段）
+        valid_tool_calls = []
+        for idx in sorted(tool_calls_acc.keys()):
+            tc = tool_calls_acc[idx]
+            if tc["id"] and tc["function"]["name"]:
+                valid_tool_calls.append({
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"].get("arguments") or "{}"
+                    }
+                })
 
         # 检查工具调用
-        if "tool_calls" not in assistant_message or not assistant_message["tool_calls"]:
+        if not valid_tool_calls:
             # 没有工具调用，直接返回回答
             print(f"[Agent] No more tools, full_content='{full_content[:100]}'")
             if stream_callback:
                 stream_callback("", True)  # 标记流结束
             return full_content, True, tool_calls_info
 
-        print(f"[Agent] Found {len(assistant_message['tool_calls'])} tool calls")
+        print(f"[Agent] Found {len(valid_tool_calls)} tool calls")
 
-        # 规范化 tool_calls：确保每个都有 type: "function"
-        valid_tool_calls = []
-        for tc in assistant_message["tool_calls"]:
-            if not tc or not tc.get("function", {}).get("name"):
-                continue
-            valid_tool_calls.append({
-                "id": tc.get("id"),
-                "type": "function",
-                "function": {
-                    "name": tc["function"]["name"],
-                    "arguments": tc["function"].get("arguments", "{}")
-                }
-            })
-        assistant_message["tool_calls"] = valid_tool_calls
         if stream_callback:
-            tool_names = [tc.get("function", {}).get("name") for tc in assistant_message["tool_calls"]]
+            tool_names = [tc.get("function", {}).get("name") for tc in valid_tool_calls]
             tool_names = [n for n in tool_names if n]
             if tool_names:
                 stream_callback(f"[TOOL_CALLS] {', '.join(tool_names)}", False)
@@ -218,13 +235,13 @@ def call_deepseek_streaming(messages: list, tools: list = None, max_iterations: 
             "content": full_content,
             "tool_calls": [
                 {"id": tc.get("id"), "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"].get("arguments") or "{}"}}
-                for tc in assistant_message["tool_calls"]
+                for tc in valid_tool_calls
                 if tc and tc.get("function", {}).get("name")
             ]
         })
 
         # 并行执行所有工具
-        for tool_call in assistant_message["tool_calls"]:
+        for tool_call in valid_tool_calls:
             tool_result = execute_tool_call(tool_call)
             tool_calls_info.append(tool_result)
 
@@ -269,6 +286,10 @@ def call_deepseek(messages: list, tools: list = None, max_iterations: int = 10) 
     def noop_callback(_chunk, _is_final):
         pass
     return call_deepseek_streaming(messages, tools, max_iterations, stream_callback=noop_callback)
+
+
+# 逐字回调（打字机效果）用的空格缩进常量：兼容 Markdown 渲染时逐字追加丢缩进
+_STREAM_SPACE_PAD = " "
 
 
 class AIChatView(View):
@@ -328,7 +349,7 @@ class AIChatView(View):
                 messages.append(h)
         messages.append({"role": "user", "content": message})
 
-        # 调用流式 Agent Loop
+        # 调用流式 Agent Loop（SSE 逐 chunk）
         answer, success, tool_calls = call_deepseek_streaming(
             messages, AVAILABLE_TOOLS, stream_callback=stream_callback
         )
@@ -369,6 +390,61 @@ class AIChatView(View):
                     daily_limit=result.get("daily_limit")
                 )
             return create_error_response(msg, CODE_ERROR)
+
+
+# ==================== 流式转发（打字机效果）====================
+# 消费者进程通过 Redis 列表（RPUSH/BRPOP）把 SSE chunk 实时转发给 app 进程，
+# app 进程再推送到 Socket.IO 房间。事件约定：
+#   "ai_stream_token"  文本增量 chunk
+#   "ai_stream_end"    流结束标记（最终完整结果走 ai_chat_result）
+_STREAM_CHANNEL_PREFIX = "ai_chat:stream:"
+
+
+def stream_forward_publish(sid: str, event: str, data: dict) -> None:
+    """消费者进程：把流式事件发布到 Redis 转发通道（app 进程 BRPOP 后推送 Socket.IO）"""
+    try:
+        import redis
+        r = redis.Redis.from_url(ai_chat_redis_url(), decode_responses=True)
+        r.rpush(f"{_STREAM_CHANNEL_PREFIX}{sid}", json.dumps({"event": event, "data": data}, ensure_ascii=False))
+    except Exception as e:
+        print(f"[ai_stream] 转发发布失败: {e}")
+
+
+def ai_chat_redis_url() -> str:
+    """延迟导入 config，避免循环依赖"""
+    from config import REDIS_URL
+    return REDIS_URL
+
+
+def build_stream_callback(sid: str):
+    """构造消费者的流式回调：把 DeepSeek 的 chunk 逐个转发到 Redis 通道"""
+    def _cb(chunk: str, is_final: bool):
+        # 过滤工具执行标记（不在打字机里显示）
+        if chunk and (chunk.startswith("[TOOL_") or chunk == "[TOOL_COMPLETE]" or chunk.startswith("[TOOL_ERROR]")):
+            return
+        if chunk:
+            stream_forward_publish(sid, "ai_stream_token", {"token": chunk})
+        if is_final:
+            stream_forward_publish(sid, "ai_stream_end", {"final": True})
+    return _cb
+
+
+def consume_sid_stream(sid: str, timeout: float = 300) -> list:
+    """app 进程（async 任务）：订阅 Redis 通道，收齐 token 和 end 事件，返回事件列表"""
+    import redis as redis_lib
+    r = redis_lib.Redis.from_url(ai_chat_redis_url(), decode_responses=True)
+    events = []
+    end = False
+    # 阻塞读取：有数据即出，超时返回已收事件
+    while not end:
+        item = r.blpop(f"{_STREAM_CHANNEL_PREFIX}{sid}", timeout=2)
+        if item is None:
+            break
+        evt = json.loads(item[1])
+        events.append(evt)
+        if evt.get("event") == "ai_stream_end":
+            end = True
+    return events
 
 
 ai_chat_view = AIChatView.as_view("ai_chat")

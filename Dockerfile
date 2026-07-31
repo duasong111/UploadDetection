@@ -25,4 +25,8 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 5000
 
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "3", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "info"]
+# 容器启动脚本：uvicorn + 设备上报消费者 + AI 聊天消费者 一并启动
+# （FastAPI + Socket.IO 是 ASGI 应用，用 uvicorn；单 worker 保证 Socket.IO 稳定）
+RUN chmod +x /app/docker-entrypoint.sh
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

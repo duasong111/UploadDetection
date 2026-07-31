@@ -62,8 +62,8 @@ pip install -r requirements.txt
 # 开发模式
 python app.py
 
-# 生产模式
-gunicorn app:app --bind 0.0.0.0:5000 --workers 3
+# 生产模式（FastAPI + Socket.IO 是 ASGI 应用，用 uvicorn 启动）
+uvicorn app:socket_app --host 0.0.0.0 --port 5000 --workers 1
 ```
 
 ## Docker 部署
@@ -89,6 +89,13 @@ docker image prune -f
 ```bash
 docker run -d -p 5000:5000 --name uploaddetection-container uploaddetection
 ```
+
+> 容器内通过 `docker-entrypoint.sh` 一并启动了三个进程：
+> 1. **uvicorn**（FastAPI + Socket.IO，ASGI 服务，端口 5000）
+> 2. **设备上报消费者**（`python -m functions.device.device_report_consumer`，批量落库）
+> 3. **AI 聊天消费者**（`python -m functions.ai.ai_chat_consumer`，DeepSeek Agent Loop）
+>
+> 日志查看：`docker logs -f uploaddetection-container`
 
 ## API 接口
 

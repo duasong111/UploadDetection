@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import io
 from concurrent.futures import ThreadPoolExecutor
+from functions.ai.ai_chat import consume_sid_stream
+from functions.ai.ai_chat_result import get_result
 
 import socketio
 import uvicorn
@@ -17,7 +19,8 @@ from config import REDIS_URL, CODE_ERROR
 from Common.Response import create_response, create_ai_response, create_error_response
 from functions.ai.book_rag import book_rag_service
 from functions.firmware import FirmwareManager
-from functions.device.device import list_devices, query_device_history, save_runtime, query_device
+from functions.device.device_api import list_devices, query_device_history, query_device
+from functions.device.device_report import save_runtime
 from functions.frp.frp_api import query_frp_uptime, update_frp_config, update_n2n_config, add_frp
 from functions.ssh.ssh_api import add_license, batch_deploy, add_duration, control_duration, quick_configuration
 import redis
@@ -37,7 +40,7 @@ executor = ThreadPoolExecutor(max_workers=20)
 # ==================== Socket.IO ====================
 @sio.event
 async def connect(sid, _environ):
-    await socket_app.emit('connected', {'sid': sid}, room=sid)
+    await sio.emit('connected', {'sid': sid}, room=sid)
 
 @sio.event
 async def disconnect(_sid):
@@ -45,27 +48,67 @@ async def disconnect(_sid):
 
 @sio.event
 async def ping_server(sid):
-    await socket_app.emit('pong', {'time': None}, room=sid)
+    await sio.emit('pong', {'time': None}, room=sid)
 
 @sio.event
 async def ai_chat(sid, data):
-    from functions.ai.ai_chat import AIChatView
+    """AI 聊天（Socket.IO）：请求入队，消费者流式转发，打字机效果推送"""
+    from functions.ai.ai_chat_producer import publish_ai_chat
+
     message, history, username = data.get('message'), data.get('history', []), data.get('username')
     if not message:
-        await socket_app.emit('ai_response', {'success': False, 'message': '消息内容不能为空'}, room=sid)
+        await sio.emit('ai_response', {'success': False, 'message': '消息内容不能为空'}, room=sid)
         return
 
-    await socket_app.emit('ai_stream_start', {'status': 'started'}, room=sid)
-    chat_view = AIChatView()
+    # 入队：立即返回，不再阻塞线程池
+    task_id = publish_ai_chat(message, history, username, channel="socketio", sid=sid)
+    if not task_id:
+        await sio.emit('ai_response', {'success': False, 'message': '消息队列不可用，请稍后重试'}, room=sid)
+        return
 
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, lambda: chat_view.chat_streaming(message, history, username, stream_callback=None))
+    await sio.emit('ai_stream_start', {'status': 'started'}, room=sid)
 
-    answer, success, tool_calls_info, daily_usage = result
-    await socket_app.emit('ai_stream_end', {
-        'answer': answer, 'tool_calls': tool_calls_info, 'success': success,
-        'daily_usage': daily_usage, 'daily_limit': 10
-    }, room=sid)
+
+    async def _emit_stream_events(events: list):
+        """把一批转发事件推给客户端"""
+        for evt in events:
+            if evt.get("event") == "ai_stream_token":
+                token = evt.get("data", {}).get("token", "")
+                if token:
+                    await sio.emit('ai_stream_token', {'token': token}, room=sid)
+            # ai_stream_end 只是结束标记，最终结果以 ai_chat_result 为准
+
+    # 循环：边等结果边把流式事件推给客户端
+    while True:
+        result = get_result(task_id)
+        if result is None:
+            # 结果尚未写入（消费者还在处理），继续转发流式 chunk
+            events = consume_sid_stream(sid, timeout=2)
+            if events:
+                await _emit_stream_events(events)
+            await asyncio.sleep(0.05)
+            continue
+
+        status = result.get("status")
+        if status in ("done", "error"):
+            # 结果已出：先把剩余流式事件推完，再推送最终结果
+            events = consume_sid_stream(sid, timeout=1)
+            if events:
+                await _emit_stream_events(events)
+            await sio.emit('ai_stream_end', {
+                'answer': result.get("answer"),
+                'tool_calls': result.get("tool_calls"),
+                'success': status == "done",
+                'daily_usage': result.get("daily_usage"),
+                'daily_limit': result.get("daily_limit", 20),
+            }, room=sid)
+            return
+        else:
+            # 还在 pending：转发流式 chunk 后继续等
+            events = consume_sid_stream(sid, timeout=2)
+            if events:
+                await _emit_stream_events(events)
+            await asyncio.sleep(0.05)
 
 
 # ==================== 辅助 ====================
@@ -343,23 +386,55 @@ async def api_firmware_delete(request: Request):
 # ==================== AI 聊天 ====================
 @app.post("/api/ai_chat/")
 async def api_ai_chat(request: Request):
-    from functions.ai.ai_chat import AIChatView
+    """AI 聊天（HTTP）：请求入队，立即返回 task_id，前端轮询 /api/ai_chat/result/"""
+    from functions.ai.ai_chat_producer import publish_ai_chat
+    from functions.ai.ai_chat_result import init_task
+    from functions.ai.ai_chat import AI_DAILY_LIMIT
+
     data = await request.json()
     message, history, username = data.get("message"), data.get("history", []), data.get("username")
     if not message: return create_error_response("Message required", CODE_ERROR)
 
-    def _chat():
-        return AIChatView().chat(message, history, username)
+    # 每日限制前置检查（与旧逻辑一致，duasong 用户不受限）
+    from functions.ai.ai_chat import get_ai_usage_count
+    if username and username != "duasong":
+        count = get_ai_usage_count(username)
+        if count >= AI_DAILY_LIMIT:
+            return create_ai_response(403, f"Daily limit reached ({count}/{AI_DAILY_LIMIT})", False,
+                                      daily_usage=count, daily_limit=AI_DAILY_LIMIT)
 
-    result, success = await run_sync(_chat)
+    task_id = publish_ai_chat(message, history, username, channel="http")
+    if not task_id:
+        return create_error_response("消息队列不可用，请稍后重试", CODE_ERROR)
 
-    if success:
-        return create_ai_response(200, "Success", True, answer=result.get("answer"), tool_calls=result.get("tool_calls"), daily_usage=result.get("daily_usage"), daily_limit=result.get("daily_limit"))
-    else:
-        msg = result.get("message", "Error")
-        if "limit" in msg.lower():
-            return create_ai_response(403, msg, False, daily_usage=result.get("daily_usage"), daily_limit=result.get("daily_limit"))
-        return create_error_response(msg, CODE_ERROR)
+    init_task(task_id)
+    return create_ai_response(200, "任务已提交", True, extra={"task_id": task_id})
+
+
+@app.get("/api/ai_chat/result/")
+async def api_ai_chat_result(task_id: str = None):
+    """AI 聊天结果轮询接口（HTTP 异步模式）"""
+    from functions.ai.ai_chat_result import get_result
+    if not task_id:
+        return create_error_response("缺少 task_id", CODE_ERROR)
+
+    result = get_result(task_id)
+    if result is None:
+        return create_response(404, "任务不存在或已过期", False)
+
+    status = result.get("status")
+    if status == "pending":
+        return create_ai_response(202, "任务处理中", False, extra={"status": "pending"})
+    if status == "done":
+        return create_ai_response(200, "Success", True,
+                                  answer=result.get("answer"),
+                                  tool_calls=result.get("tool_calls"),
+                                  daily_usage=result.get("daily_usage"),
+                                  daily_limit=result.get("daily_limit"))
+    # error
+    return create_ai_response(500, result.get("message") or "AI 处理失败", False,
+                              daily_usage=result.get("daily_usage"),
+                              daily_limit=result.get("daily_limit"))
 
 
 # ==================== Ansible 任务接口 ====================
