@@ -4,13 +4,14 @@
 
 ## 技术栈
 
-- **后端框架**: FastAPI 0.109+ + Socket.IO
+- **后端框架**: FastAPI 0.110+ + Socket.IO
 - **数据库**: PostgreSQL 15+
-- **缓存**: Redis 7.x
+- **缓存**: Redis 7.x（在线心跳、接口缓存、速率限制）
+- **消息队列**: RabbitMQ 7.x（批量落库解耦 + AI Agent 队列异步消峰）
 - **向量数据库**: ChromaDB (RAG 知识库)
 - **对象存储**: MinIO / RUSTFS (文件、头像、固件存储)
 - **自动化运维**: Ansible (Playbook 批量部署)
-- **AI 集成**: DeepSeek Chat + Tool Calling + RAG
+- **AI 集成**: DeepSeek Chat + Tool Calling / Agent Loop + RAG
 - **文件上传**: 分片上传 + 断点续传 + ClamAV 病毒扫描
 - **远程设备管理**: SSH + Paramiko + WebSocket Agent
 - **容器化部署**: Docker + Uvicorn
@@ -18,7 +19,7 @@
 ## 功能特性
 
 - ✅ 用户登录/注册 & 头像管理
-- ✅ 设备运行时长上报 & 在线状态监控
+- ✅ 设备运行时长上报 & 在线状态监控（Redis 心跳 + RabbitMQ 批量落库）
 - ✅ 设备列表管理 & 历史数据查询
 - ✅ FRP 设备配置管理 & N2N 组网
 - ✅ 远程 SSH 部署（授权文件、批量部署）
@@ -30,6 +31,7 @@
 - ✅ RAG 知识库（书籍 RAG + 设备知识库）
 - ✅ WebSocket Agent 远程设备控制
 - ✅ 用户操作频率限制（License 管理、全局速率控制）
+- ✅ RabbitMQ 消息队列（设备上报批量消费 + AI 聊天异步消峰）
 
 ## 快速开始
 
@@ -38,6 +40,8 @@
 - Python 3.12+
 - PostgreSQL 15+
 - Redis 7+
+- RabbitMQ 7.x（可选，不配置时落库降级为直接写入）
+- ClamAV（可选，部署在 Docker 中用于文件病毒扫描）
 
 ### 安装依赖
 
@@ -52,7 +56,14 @@ pip install -r requirements.txt
    cp config.example.py config.py
    ```
 
-2. 修改 `config.py` 中的敏感配置（数据库、Redis、AI Key 等）
+2. 修改 `config.py` 中的敏感配置：
+   - 数据库连接（PostgreSQL）
+   - Redis 连接
+   - RabbitMQ 连接（可选）
+   - AI Agent Key（DeepSeek）
+   - 对象存储密钥（RUSTFS / MinIO）
+   - FRPS 服务器地址
+   - ClamAV 容器地址
 
 > ⚠️ **重要**: `config.py` 包含敏感信息，已被 `.gitignore` 排除，不会提交到 GitHub。
 
@@ -92,8 +103,10 @@ docker run -d -p 5000:5000 --name uploaddetection-container uploaddetection
 
 > 容器内通过 `docker-entrypoint.sh` 一并启动了三个进程：
 > 1. **uvicorn**（FastAPI + Socket.IO，ASGI 服务，端口 5000）
-> 2. **设备上报消费者**（`python -m functions.device.device_report_consumer`，批量落库）
+> 2. **设备上报消费者**（`python -m functions.device.device_report_consumer`，RabbitMQ 攒批落库）
 > 3. **AI 聊天消费者**（`python -m functions.ai.ai_chat_consumer`，DeepSeek Agent Loop）
+>
+> 容器启动时会自动等待 RabbitMQ 就绪（最多 60 秒），消费者才能正常消费消息。
 >
 > 日志查看：`docker logs -f uploaddetection-container`
 
@@ -178,36 +191,53 @@ docker run -d -p 5000:5000 --name uploaddetection-container uploaddetection
 ```
 ├── app.py                    # FastAPI 主入口，纯路由层
 ├── config.example.py         # 配置文件模板（替代 config.py 提交到 Git）
+├── config.py                 # 实际配置（.gitignore 排除，含敏感信息）
 ├── requirements.txt          # 依赖列表
 ├── Dockerfile                # Docker 容器化部署
+├── docker-entrypoint.sh      # 容器入口（同时启动 uvicorn + 消费者）
 ├── CLAUDE.md                 # AI 编码约束文档
 │
 ├── functions/                # 业务逻辑模块（核心）
 │   ├── user.py               # 用户注册/登录/改密
 │   ├── avatar.py             # 用户头像上传（MinIO 对象存储）
-│   ├── device_api.py         # 设备 API 管理
-│   ├── device.py             # 设备数据处理
-│   ├── device_query.py       # 设备高级查询
-│   ├── frp_api.py            # FRP 代理配置 API
-│   ├── frp.py                # FRP 核心业务逻辑（配置生成、推送到服务器）
-│   ├── ssh_api.py            # SSH 远程操作（授权文件部署、批量部署）
-│   ├── ssh_config.py         # SSH 配置管理（License 部署日志）
+│   ├── check.py              # 密码强度校验
+│   │
+│   ├── device/               # 设备模块（解耦）
+│   │   ├── device_api.py     # 设备 API 管理
+│   │   ├── device.py         # 设备数据处理
+│   │   ├── device_query.py   # 设备高级查询
+│   │   ├── device_report.py  # 设备上报生产者（RabbitMQ）
+│   │   ├── device_report_consumer.py  # 设备上报批量消费者（攒批 UPSERT）
+│   │   └── device_heartbeat.py        # 设备在线心跳（Redis TTL）
+│   │
+│   ├── frp/                  # FRP 模块（解耦）
+│   │   ├── frp_api.py        # FRP 代理配置 API
+│   │   └── frp.py            # FRP 核心业务逻辑（配置生成、推送到服务器）
+│   │
+│   ├── ssh/                  # SSH 模块（解耦）
+│   │   ├── ssh_api.py        # SSH 远程操作（授权文件部署、批量部署）
+│   │   └── ssh_config.py     # SSH 配置管理（License 部署日志）
+│   │
+│   ├── ai/                   # AI 模块（解耦）
+│   │   ├── ai_chat.py        # AI 智能聊天（流式响应 + Tool Calling）
+│   │   ├── ai_chat_producer.py    # AI 聊天请求生产者（RabbitMQ）
+│   │   ├── ai_chat_consumer.py    # AI 聊天消费者（DeepSeek Agent Loop）
+│   │   ├── ai_chat_result.py      # AI 聊天结果查询
+│   │   ├── book_rag.py       # 书籍 RAG 知识库（PDF 切片 → ChromaDB）
+│   │   └── rag_knowledge.py  # 设备知识库 RAG（TF-IDF + ChromaDB）
+│   │
 │   ├── ansible_tasks.py      # Ansible 自动化运维调度
 │   ├── transmission.py       # 远程设备配置传输（N2N 组网、FRPC 部署）
 │   ├── duration_stastic.py   # 运行时长统计（部署 duration_time 脚本）
-│   │
 │   ├── upload_manager.py     # 安全文件上传（分片上传、断点续传、病毒扫描）
 │   ├── firmware.py           # 固件管理（上传/下载/去重/限流）
 │   │
-│   ├── ai_chat.py            # AI 智能聊天（流式响应 + Tool Calling）
-│   ├── book_rag.py           # 书籍 RAG 知识库（PDF 切片 → ChromaDB 向量检索）
-│   ├── rag_knowledge.py      # 设备知识库 RAG（TF-IDF + ChromaDB）
-│   │
-│   ├── check.py              # 密码强度校验
 │   └── tools/                # AI Tool Calling 工具集
 │       ├── devices_info_tools.py    # 设备信息查询工具（带 Redis 缓存）
 │       ├── schema.py                # Tool Schema 统一构建器
-│       └── tools_calling_export.py  # 工具统一导出
+│       ├── tools_calling_export.py  # 工具统一导出
+│       ├── test_tools.py            # 工具测试
+│       └── __init__.py
 │
 ├── ansible/                  # Ansible 自动化运维
 │   ├── ansible.cfg           # Ansible 配置
@@ -220,8 +250,12 @@ docker run -d -p 5000:5000 --name uploaddetection-container uploaddetection
 │
 ├── Common/                   # 公共模块
 │   ├── Response.py           # 统一响应封装
+│   ├── rabbitmq.py           # RabbitMQ 连接管理（pika，线程本地连接）
 │   ├── ssh.py                # SSH 远程连接 2.0（WebSocket Agent）
-│   └── duration_time.py      # 设备端运行时长上报脚本
+│   ├── duration_time.py      # 设备端运行时长上报脚本
+│   ├── LicenseGenerator      # License 生成器（ARM64 可执行文件）
+│   ├── config_frp.txt        # FRP 配置模板
+│   └── config_n2n.txt        # N2N 配置模板
 │
 ├── database/                 # 数据库模块
 │   ├── Postgresql.py         # PostgreSQL 连接池
@@ -261,9 +295,12 @@ docker run -d -p 5000:5000 --name uploaddetection-container uploaddetection
 ## 注意事项
 
 1. 首次部署需要创建数据库表，可运行 `migrations/` 目录下的脚本
-2. Redis 作为缓存使用，写入失败不影响主流程
-3. 设备运行时长上报采用 UPSERT 模式，自动去重更新
-4. 建议使用 Docker 进行生产环境部署
+2. RabbitMQ 作为消峰缓冲：设备上报/AI 请求先进队列，由消费者攒批落库；队列异常时设备心跳仍通过 Redis 实时判定在线
+3. Redis 作为缓存使用，写入失败不影响主流程
+4. 设备运行时长上报采用 UPSERT 模式，自动去重更新，`max_runtime_seconds` 只增不减
+5. 设备上报消费者批量落库：攒满 `DEVICE_REPORT_BATCH_SIZE`（50）条或间隔 `DEVICE_REPORT_BATCH_INTERVAL`（10）秒触发一次；单批失败自动拆半重试
+6. 在线状态基于 Redis 心跳（TTL 90 秒，设备 60 秒上报一次，3 倍余量判离线），与批量落库解耦
+7. 建议使用 Docker 进行生产环境部署
 
 ## License
 
