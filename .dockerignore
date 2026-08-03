@@ -1,9 +1,48 @@
+# Python
 .venv
-__pycache__/
+__pycache__
 *.pyc
 *.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+.mypy_cache
+.pytest_cache
+.tox
+
+# Git
 .git
 .gitignore
+.gitattributes
+
+# 环境与配置
 .env
-node_modules/
+.env.*
+config.local.py
+*.log
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# 文档与数据
+*.md
+!requirements.txt
+docs/
 chroma_data/
+books/
+uploads/
+device_run_session.csv
+migrations/
+
+# 其他
+node_modules/
+.npm
+.cache
+.DS_Store

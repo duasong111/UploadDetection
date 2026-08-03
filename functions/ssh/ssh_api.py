@@ -1,12 +1,16 @@
 """
 SSH & 设备配置 API 模块
 """
+import json
 import os
 import time
 import paramiko
+from datetime import datetime
 from typing import Dict, List
 
 from Common.Response import create_response
+from Common.redis_pubsub import publish
+from database.operateFunction import execuFunction
 
 
 def add_license(device_ip: str, password: str) -> Dict:
@@ -256,9 +260,53 @@ def control_duration(ip: str, password: str, enable: bool) -> Dict:
 
 
 def quick_configuration(params: dict) -> Dict:
-    """设备快速配置"""
-    def update_progress(step_index, msg, success=True):
-        pass  # 可扩展 Redis 进度推送
+    """设备快速配置（9 步配置 + Pub/Sub 实时进度推送 + Redis 兜底缓存）"""
+    import redis
+    from config import REDIS_URL
+
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    log_id = None
+    steps_status = [False] * 9
+    full_output = []
+
+    # 先在数据库写入初始记录（复用 transmission.py 的 device_config_log 表）
+    try:
+        sql = """
+            INSERT INTO device_config_log (device_sn, device_ip, operator, status, config_details, step_results)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+        """
+        init_steps = json.dumps([False] * 9)
+        config_json = json.dumps(params)
+        res = execuFunction(sql, (
+            params.get('device_sn_value'), params.get('device_ip'),
+            params.get('operator', 'system_admin'), 'running', config_json, init_steps))
+        if res:
+            log_id = res[0][0]
+    except Exception as e:
+        print(f"[quick_configuration] 写入初始日志失败: {e}")
+
+    redis_key = f"config_live_log:{log_id}" if log_id else None
+
+    def update_progress(step_index: int, msg: str, success: bool = True):
+        steps_status[step_index] = success
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        formatted_msg = f"[{timestamp}] {msg}"
+        full_output.append(formatted_msg)
+        progress_data = {"steps": steps_status, "latest_msg": formatted_msg, "log_id": log_id}
+
+        # 1) Redis 缓存兜底（供 HTTP 轮询）
+        if redis_key:
+            try:
+                r.setex(redis_key, 3600, json.dumps(progress_data))
+            except Exception:
+                pass
+
+        # 2) Pub/Sub 实时推送（WebSocket 前端监听）
+        if log_id:
+            try:
+                publish(f"config:progress:{log_id}", "progress", progress_data)
+            except Exception:
+                pass
 
     try:
         ssh = paramiko.SSHClient()
@@ -274,17 +322,42 @@ def quick_configuration(params: dict) -> Dict:
             ssh.exec_command(cmd)
             time.sleep(0.5)
 
+        update_progress(0, f"正在连接设备 {params['device_ip']}...")
         exec_cmd(f"sed -i 's/\"device_sn\"\\s*:\\s*\"[^\"]*\"/\"device_sn\": \"{params['device_sn_value']}\"/g' /home/client_for_camera/config.jsonc")
+        update_progress(1, "✓ config.jsonc 更新完成")
         exec_cmd(f"sed -i 's/name\\s*=\\s*\".*\"/name = \"{params['frpc_value']}\"/' /home/frp_0.61.1_linux_arm/frpc.toml && systemctl restart frpc.service")
+        update_progress(2, f"✓ frpc 重启完成 (Name: {params['frpc_value']})")
         exec_cmd("rm -f /home/shell/ssh_config.py")
+        update_progress(3, "✓ ssh_config.py 已清理")
         exec_cmd(f"sed -i 's|DEVICE_SN\\s*=\\s*\".*\"|DEVICE_SN = \"{params['duration_sn']}\"|' /home/shell/duration_time.py")
+        update_progress(4, "✓ duration_time.py 更新完成")
         exec_cmd(f"sed -i 's|^command=.*|command={params['n2n_command']}|' /etc/supervisor/conf.d/n2n.conf")
+        update_progress(5, "✓ n2n.conf 更新完成")
         exec_cmd("sed -i 's/autostart=true/autostart=false/g' /etc/supervisor/conf.d/AutoScript.conf")
+        update_progress(6, "✓ AutoScript 设置为非自启")
         exec_cmd("sed -i 's/autostart=true/autostart=false/g' /etc/supervisor/conf.d/captive_portal_setting.conf")
-        exec_cmd("supervisorctl update && supervisorctl reread")
+        update_progress(7, "✓ captive_portal 设置为非自启")
+        exec_cmd("supervisorctl update && reread")
+        update_progress(8, "✓ 配置完成，Supervisor 已重载")
+
+        # 任务成功：更新数据库
+        if log_id:
+            try:
+                execuFunction(
+                    "UPDATE device_config_log SET status='success', full_log=%s, step_results=%s, finish_time=%s WHERE id=%s",
+                    ("\n".join(full_output), json.dumps(steps_status), datetime.now(), log_id))
+            except Exception:
+                pass
 
         ssh.close()
-        return create_response(200, "配置任务已下发", True, {"status": "success"})
+        return create_response(200, "配置任务已下发", True, {"log_id": log_id, "status": "success"})
 
     except Exception as e:
+        if log_id:
+            try:
+                execuFunction(
+                    "UPDATE device_config_log SET status='failed', full_log=%s, step_results=%s, finish_time=%s WHERE id=%s",
+                    ("\n".join(full_output), json.dumps(steps_status), datetime.now(), log_id))
+            except Exception:
+                pass
         return create_response(500, f"配置失败: {str(e)}", False)

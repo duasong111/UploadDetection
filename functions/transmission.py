@@ -6,6 +6,7 @@ from flask import request
 from flask.views import MethodView
 from http import HTTPStatus
 from Common.Response import create_response
+from Common.redis_pubsub import publish
 from database.operateFunction import execuFunction
 from datetime import datetime
 import redis
@@ -62,9 +63,14 @@ class Configuration(MethodView):
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             formatted_msg = f"[{timestamp}] {msg}"
             full_output.append(formatted_msg)
-            # 实时推送到 Redis (保留 1 小时)
             progress_data = {"steps": steps_status, "latest_msg": formatted_msg}
+            # 实时推送到 Redis 缓存 (保留 1 小时，供 HTTP 轮询兜底)
             redis_client.setex(redis_key, 3600, json.dumps(progress_data))
+            # Pub/Sub 实时推送（WebSocket 前端监听，降低轮询延迟）
+            try:
+                publish(f"config:progress:{log_id}", "progress", progress_data)
+            except Exception:
+                pass
 
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())

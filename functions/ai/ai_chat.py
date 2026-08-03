@@ -393,19 +393,20 @@ class AIChatView(View):
 
 
 # ==================== 流式转发（打字机效果）====================
-# 消费者进程通过 Redis 列表（RPUSH/BRPOP）把 SSE chunk 实时转发给 app 进程，
-# app 进程再推送到 Socket.IO 房间。事件约定：
+# 消费者进程通过 Redis Pub/Sub（PUBLISH）把 SSE chunk 实时转发给 app 进程，
+# app 进程订阅后推送到 Socket.IO 房间。事件约定：
 #   "ai_stream_token"  文本增量 chunk
 #   "ai_stream_end"    流结束标记（最终完整结果走 ai_chat_result）
 _STREAM_CHANNEL_PREFIX = "ai_chat:stream:"
 
 
 def stream_forward_publish(sid: str, event: str, data: dict) -> None:
-    """消费者进程：把流式事件发布到 Redis 转发通道（app 进程 BRPOP 后推送 Socket.IO）"""
+    """消费者进程：把流式事件发布到 Redis 转发通道（app 进程订阅后推送 Socket.IO）
+    改用 Pub/Sub 实现推送式转发，替代原列表 RPUSH/BRPOP 轮询，降低打字机延迟。
+    """
     try:
-        import redis
-        r = redis.Redis.from_url(ai_chat_redis_url(), decode_responses=True)
-        r.rpush(f"{_STREAM_CHANNEL_PREFIX}{sid}", json.dumps({"event": event, "data": data}, ensure_ascii=False))
+        from Common.redis_pubsub import publish
+        publish(f"{_STREAM_CHANNEL_PREFIX}{sid}", event, data)
     except Exception as e:
         print(f"[ai_stream] 转发发布失败: {e}")
 
@@ -418,33 +419,41 @@ def ai_chat_redis_url() -> str:
 
 def build_stream_callback(sid: str):
     """构造消费者的流式回调：把 DeepSeek 的 chunk 逐个转发到 Redis 通道"""
+    from Common.redis_pubsub import publish
+
     def _cb(chunk: str, is_final: bool):
         # 过滤工具执行标记（不在打字机里显示）
         if chunk and (chunk.startswith("[TOOL_") or chunk == "[TOOL_COMPLETE]" or chunk.startswith("[TOOL_ERROR]")):
             return
         if chunk:
-            stream_forward_publish(sid, "ai_stream_token", {"token": chunk})
+            publish(f"{_STREAM_CHANNEL_PREFIX}{sid}", "ai_stream_token", {"token": chunk})
         if is_final:
-            stream_forward_publish(sid, "ai_stream_end", {"final": True})
+            publish(f"{_STREAM_CHANNEL_PREFIX}{sid}", "ai_stream_end", {"final": True})
     return _cb
 
 
 def consume_sid_stream(sid: str, timeout: float = 300) -> list:
-    """app 进程（async 任务）：订阅 Redis 通道，收齐 token 和 end 事件，返回事件列表"""
-    import redis as redis_lib
-    r = redis_lib.Redis.from_url(ai_chat_redis_url(), decode_responses=True)
-    events = []
-    end = False
-    # 阻塞读取：有数据即出，超时返回已收事件
-    while not end:
-        item = r.blpop(f"{_STREAM_CHANNEL_PREFIX}{sid}", timeout=2)
-        if item is None:
+    """app 进程（async 任务）：订阅 Redis 频道，收齐 token 和 end 事件，返回事件列表
+    采用后台线程监听 Pub/Sub + 短超时取出，比阻塞型 BRPOP 更贴合 asyncio 事件循环。
+    """
+    from Common.redis_pubsub import PubSubListener
+    listener = PubSubListener(f"{_STREAM_CHANNEL_PREFIX}{sid}")
+    try:
+        events = []
+        end = False
+        while not end:
+            raw = listener.get_events(timeout=timeout)
+            for event, data in raw:
+                evt = {"event": event, "data": data}
+                events.append(evt)
+                if event == "ai_stream_end":
+                    end = True
+            if raw:
+                continue
             break
-        evt = json.loads(item[1])
-        events.append(evt)
-        if evt.get("event") == "ai_stream_end":
-            end = True
-    return events
+        return events
+    finally:
+        listener.close()
 
 
 ai_chat_view = AIChatView.as_view("ai_chat")

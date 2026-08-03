@@ -68,33 +68,21 @@ async def ai_chat(sid, data):
 
     await sio.emit('ai_stream_start', {'status': 'started'}, room=sid)
 
-
-    async def _emit_stream_events(events: list):
-        """把一批转发事件推给客户端"""
-        for evt in events:
-            if evt.get("event") == "ai_stream_token":
-                token = evt.get("data", {}).get("token", "")
-                if token:
-                    await sio.emit('ai_stream_token', {'token': token}, room=sid)
-            # ai_stream_end 只是结束标记，最终结果以 ai_chat_result 为准
-
     # 循环：边等结果边把流式事件推给客户端
     while True:
         result = get_result(task_id)
         if result is None:
-            # 结果尚未写入（消费者还在处理），继续转发流式 chunk
             events = consume_sid_stream(sid, timeout=2)
             if events:
-                await _emit_stream_events(events)
+                await _emit_stream_events(sid, events)
             await asyncio.sleep(0.05)
             continue
 
         status = result.get("status")
         if status in ("done", "error"):
-            # 结果已出：先把剩余流式事件推完，再推送最终结果
             events = consume_sid_stream(sid, timeout=1)
             if events:
-                await _emit_stream_events(events)
+                await _emit_stream_events(sid, events)
             await sio.emit('ai_stream_end', {
                 'answer': result.get("answer"),
                 'tool_calls': result.get("tool_calls"),
@@ -104,11 +92,50 @@ async def ai_chat(sid, data):
             }, room=sid)
             return
         else:
-            # 还在 pending：转发流式 chunk 后继续等
             events = consume_sid_stream(sid, timeout=2)
             if events:
-                await _emit_stream_events(events)
+                await _emit_stream_events(sid, events)
             await asyncio.sleep(0.05)
+
+
+@sio.event
+async def subscribe_config(sid, data):
+    """前端订阅某个配置任务的实时进度（Pub/Sub 推送）
+    客户端在 POST /api/quick_configuration/ 拿到 log_id 后调用：
+        socket.emit('subscribe_config', {'log_id': 123})
+    之后配置进度会以 config_progress 事件推送到该连接。
+    若不监听，仍可通过 GET /api/config_progress/?log_id= 轮询兜底。
+    """
+    log_id = data.get("log_id") if isinstance(data, dict) else None
+    if not log_id:
+        await sio.emit('config_progress', {'success': False, 'message': '缺少 log_id'}, room=sid)
+        return
+
+    async def _relay_progress():
+        """后台线程订阅 Redis 频道，收到消息后转发到 Socket.IO 房间"""
+        from Common.redis_pubsub import PubSubListener
+        listener = PubSubListener(f"config:progress:{log_id}")
+        try:
+            while True:
+                events = await asyncio.to_thread(listener.get_events, 2.0)
+                if not events:
+                    continue
+                for _, evt_data in events:
+                    await sio.emit('config_progress', {'success': True, **evt_data}, room=sid)
+        finally:
+            listener.close()
+
+    asyncio.create_task(_relay_progress())
+    await sio.emit('config_progress', {'success': True, 'subscribed': True, 'log_id': log_id}, room=sid)
+
+
+async def _emit_stream_events(sid: str, events: list):
+    """把一批流式转发事件推给指定 Socket.IO 客户端"""
+    for evt in events:
+        if evt.get("event") == "ai_stream_token":
+            token = evt.get("data", {}).get("token", "")
+            if token:
+                await sio.emit('ai_stream_token', {'token': token}, room=sid)
 
 
 # ==================== 辅助 ====================
